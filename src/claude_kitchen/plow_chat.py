@@ -12,6 +12,7 @@ Every send that reaches anyone but the line's owner first goes past a fresh revi
 model, which reads the live thread (and, once `messages-host` names the latch host
 holding the owner's Messages, the owner's other recent threads with the same people)
 and holds a text that contradicts them, makes the owner look out of the loop, or isn't needed.
+A person's text gets a 👀 tapback once handed over, cleared once a send in its chat goes out.
 """
 import asyncio
 import json
@@ -31,7 +32,7 @@ from mcp.types import Tool
 from claude_kitchen.channel import push, reply_server
 from claude_kitchen.state import atomic_write_json, plow_chat_dir, read_env, state_dir, with_digest
 
-CREDENTIALS = "plow-credentials"  # written mode 600 by `latch agents new --own --credential-file`
+CREDENTIALS = "plow-credentials"  # written mode 600 by `latch agents new --own --token-file`
 TRUSTED_CHATS = "trusted-chats"  # one chat uid per line; read at each hand-over, so edits need no restart
 START_CHAT_ALLOW = "start-chat-allow"  # one handle per line, beyond those already in the line's chats
 STARTED_CHATS = "started-chats.log"  # one line per chat start_chat sends: time, chat, created, handles
@@ -60,6 +61,7 @@ The draft:
 {text}
 
 Answer on one line: SEND, or HOLD: followed by one sentence saying why."""
+SEEN = "👀"
 RECONNECT_DELAY = 5
 PAGE = 50
 # One speaker's back-to-back texts are one tag. iMessage sends a link as its
@@ -287,7 +289,33 @@ class Bridge:
         uids += [m["uid"] for m in self.burst]  # after delivery, so a crash mid-send can't suppress it
         del uids[:-2 * PAGE]
         atomic_write_json(self.cursor, self.taken)
-        self.burst = []
+        burst, self.burst = self.burst, []
+        said = [m for m in burst if m["body"].strip() or m["attachments"]]  # not a tapback of theirs
+        if sender and first["sender"]["type"] == "member" and said:  # recorded first, so a slow tapback can't replay it
+            await self.react(first["chat_uid"], said[-1]["uid"], "add")
+
+    async def react(self, chat: str, uid: str, operation: str):
+        """Add or remove our 👀 on a message. Plow reacts only in iMessage
+        chats, so a refusal is logged and never stops a delivery or a send."""
+        try:
+            r = await self.client.post(f"/v1/chats/{chat}/messages/{uid}/reactions",
+                                       json={"operation": operation, "type": "custom", "custom_emoji": SEEN})
+        except httpx.HTTPError as e:
+            return log(f"{operation} {SEEN} on {uid} failed: {type(e).__name__}")
+        if r.is_error:
+            log(f"{operation} {SEEN} on {uid}: HTTP {r.status_code}")
+
+    async def answered(self, chat: str):
+        """Clear our 👀 from `chat`'s latest texts. Read from Plow, so one a
+        restart or a failed removal left behind clears on the next send."""
+        try:  # the send already went out: nothing here may fail it
+            r = await self.client.get(f"/v1/chats/{chat}/messages", params={"limit": PAGE})
+            r.raise_for_status()
+        except httpx.HTTPError as e:
+            return log(f"reading chat {chat} failed ({type(e).__name__}); its {SEEN} stays")
+        for m in r.json()["data"]:
+            if any(x["custom_emoji"] == SEEN and x["actor"].get("relationship") == "self" for x in m.get("reactions", [])):
+                await self.react(chat, m["uid"], "remove")
 
     async def catch_up(self, chat: str):
         """Take what reached `chat` while the socket was down: the newest
@@ -533,12 +561,22 @@ async def call(bridge: Bridge, name: str, arguments: dict) -> str:
     """Run the Bridge method a tool names, with its arguments as keywords."""
     if name not in ("reply", SEND_FILE.name, START_CHAT.name):
         raise ValueError(f"unknown tool {name}")
-    return await getattr(bridge, name)(**arguments)
+    result = await getattr(bridge, name)(**arguments)
+    if result.startswith("sent ") and "chat" in arguments:
+        await bridge.answered(arguments["chat"])
+    return result
+
+
+def read_credentials(path: Path) -> dict:
+    """PLOW_API_BASE and PLOW_AGENT_TOKEN from `plow-credentials`: the bare token
+    `latch agents new --own --token-file` writes, or the KEY=value lines older latch wrote."""
+    text = path.read_text().strip()
+    return read_env(path) if "PLOW_AGENT_TOKEN=" in text else {"PLOW_API_BASE": "https://api.plow.co", "PLOW_AGENT_TOKEN": text}
 
 
 async def run_server(kitchen: str):
     directory = plow_chat_dir(kitchen)
-    credentials = read_env(directory / CREDENTIALS)  # PLOW_API_BASE, PLOW_AGENT_TOKEN
+    credentials = read_credentials(directory / CREDENTIALS)
     bridge = None  # bound once the HTTP client and stdio streams are open
     server, init_options = reply_server("plow-chat", "Plow chat (iMessage)",
                                         lambda name, arguments: call(bridge, name, arguments), SEND_FILE, START_CHAT)
