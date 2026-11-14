@@ -34,7 +34,8 @@ class FakePlow:
         self.files_auth = {}  # attachment uid -> Authorization header its download carried
         self.started = []  # (members, body, idempotency_key) of each chat the agent started
         self.answer = None  # (handle, body) answering a started chat before the agent reads it back
-        self.members = {"cht_home": ["+15550000001", "+15550000002"], "cht_solo": ["+15550000001"]}  # chat -> member handles GET /v1/chats lists
+        self.members = {"cht_home": ["+15550000001", "+15550000002"], "cht_solo": ["+15550000001"], "cht_agents": ["+15550000001"]}  # chat -> member handles GET /v1/chats lists
+        self.peer_chats = {"cht_agents"}  # chats that also seat a peer agent's line
         self.start_bodies = []  # each raw POST /v1/chats body
         self.reactions = []  # (message uid, operation, emoji) of each tapback the agent applied
         self.reaction_status = 200  # what the reactions route answers; Plow refuses non-iMessage chats with 400
@@ -51,7 +52,7 @@ class FakePlow:
             WebSocketRoute("/v1/ws", self._ws),
         ])
 
-    def _message(self, chat, body, handle=None, late=False, files=()):
+    def _message(self, chat, body, handle=None, late=False, files=(), mentions=()):
         if isinstance(handle, dict):
             sender = handle  # a peer agent's line or a Plow system note
         elif handle:
@@ -67,18 +68,18 @@ class FakePlow:
             host = f"http://{self.files_host}:{self.port}" if self.files_host else ""
             attachments.append({"uid": uid, "filename": name, "status": "received", "url": host + path})
         message = {"uid": f"msg_{next(self._uids)}", "chat_uid": chat, "body": body, "sender": sender,
-                   "attachments": attachments, "created_at": datetime.now(timezone.utc).isoformat()}
+                   "attachments": attachments, "mentions": list(mentions) or None, "created_at": datetime.now(timezone.utc).isoformat()}
         # A late text was sent before the newest one, so Plow sorts it below it.
         self.history[chat].insert(len(self.history[chat]) - late, message)
         return message
 
-    def add(self, chat, handle, body, late=False, files=()):
+    def add(self, chat, handle, body, late=False, files=(), mentions=()):
         """A member's text, with any (name, bytes) files, lands while no socket hears it."""
-        return self._message(chat, body, handle, late, files)
+        return self._message(chat, body, handle, late, files, mentions)
 
-    async def inbound(self, chat, handle, body, late=False, files=()):
+    async def inbound(self, chat, handle, body, late=False, files=(), mentions=()):
         """A member texts the line, and every open socket hears it."""
-        message = self.add(chat, handle, body, late, files)
+        message = self.add(chat, handle, body, late, files, mentions)
         await self._broadcast(message)
         return message
 
@@ -102,17 +103,22 @@ class FakePlow:
     async def _me(self, request):
         if not self._authorized(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        return JSONResponse({"line": {"uid": "ln_self"}, "chats": []})
+        return JSONResponse({"line": {"uid": "ln_self", "display_name": "Cedar"}, "chats": self._chats()})
+
+    def _chats(self):
+        line = {"type": "agent", "relationship": "self"}
+        return [{"uid": chat, "participants": [line] + [
+                    {"type": "member", "relationship": None, "provider_key": h, "display_name": NAMES.get(h, h),
+                     "role": "owner" if h == "+15550000001" else "member"} for h in handles]
+                 + [{"type": "agent", "relationship": "peer"}] * (chat in self.peer_chats)}
+                for chat, handles in self.members.items()]
 
     async def _start(self, request):
         """Start a chat with its first message, adopting the thread its members already have."""
         if not self._authorized(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         if request.method == "GET":
-            return JSONResponse({"data": [
-                {"uid": chat, "participants": [{"type": "member", "provider_key": h, "display_name": NAMES.get(h, h),
-                                                "role": "owner" if h == "+15550000001" else "member"} for h in handles]}
-                for chat, handles in self.members.items()]})
+            return JSONResponse({"data": self._chats()})
         sent = await request.json()
         self.start_bodies.append(sent)
         if sent["line_uid"] != "ln_self" or not sent["members"]:
