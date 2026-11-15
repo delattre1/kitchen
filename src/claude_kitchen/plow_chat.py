@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from itertools import takewhile
 from pathlib import Path
+from urllib.error import HTTPError
+from urllib.parse import quote
 
 import httpx
 import websockets
@@ -32,7 +34,8 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool
 
 from claude_kitchen.channel import push, reply_server
-from claude_kitchen.state import atomic_write_json, plow_chat_dir, read_env, state_dir, swarm_accounts, with_digest
+from claude_kitchen.state import (atomic_write_json, matrix_get, plow_chat_dir, read_env, state_dir, swarm_accounts,
+                                  swarm_credential, with_digest)
 
 CREDENTIALS = "plow-credentials"  # written mode 600 by `latch agents new --own --token-file`
 TRUSTED_CHATS = "trusted-chats"  # one chat uid per line; read at each hand-over, so edits need no restart
@@ -174,9 +177,57 @@ async def run(*args: str, stdin: str = "") -> str:
     return out.decode()
 
 
+def local(user_id: str) -> str:
+    """A Swarm user id's name: `@cedar:server` is `cedar`."""
+    return user_id[1:].split(":")[0]
+
+
+CREDIT = re.compile(r"\n— with (\S+)\s*$")  # the credit `credited` writes
+
+
 def credited(text: str, consulted: str) -> str:
     """`text` ending with who it was worked with: `@cedar:server` reads "— with cedar"."""
-    return f"{text}\n\n— with {consulted[1:].split(':')[0]}" if consulted else text
+    return f"{text}\n\n— with {local(consulted)}" if consulted else text
+
+
+def sending_accounts(kitchen: str, agent: str) -> list[dict]:
+    """The Swarm accounts a session in `kitchen` sends as: a cook hired with its
+    own (`hire --swarm-account`), else the kitchen's."""
+    mcp = state_dir(kitchen) / "cooks" / f"{agent}.mcp"
+    if agent and mcp.exists():
+        return [swarm_credential(json.loads(mcp.read_text())["mcpServers"]["swarm"]["args"][-1])]
+    return swarm_accounts(kitchen)
+
+
+def dm_with(accounts: list[dict], room: str, person: str) -> bool:
+    """Whether `room`, by its `!…` id, is a DM between `person` and one of
+    `accounts`; False when none of them is in it."""
+    for account in accounts:
+        try:
+            members = matrix_get(account, f"/rooms/{quote(room, safe='')}/joined_members")["joined"]
+        except HTTPError as e:
+            if e.code != 403:  # anything but "not in this room" stops the send
+                raise
+            continue
+        return set(members) == {account["user_id"], person}
+    return False
+
+
+def swarm_send_refusal(kitchen: str, agent: str, send: dict) -> str | None:
+    """Why `agent`'s Swarm `send` to the owner is refused on a line with
+    `consult-gate`: it must end with the credit `credited` writes, naming an
+    agent other than the owner or the sender; None to let it through."""
+    gate = plow_chat_dir(kitchen) / CONSULT_GATE
+    if not gate.exists() or send.get("dangerously_skip_attaching_a_priority"):
+        return None
+    owner, room, accounts = listed(gate).pop(), send.get("room", ""), sending_accounts(kitchen, agent)
+    if owner not in (room, *(send.get("mentions") or ())) and not (room.startswith("!") and dm_with(accounts, room, owner)):
+        return None
+    credit = CREDIT.search(send.get("text", ""))
+    if credit and credit[1] not in {local(owner), *(local(a["user_id"]) for a in accounts)}:
+        return None
+    return ("not sent: a message to the head chef ends \"— with <agent>\", naming the Swarm agent you "
+            "worked it with first, not yourself or them: work it with one, then send")
 
 
 async def ask_reviewer(prompt: str) -> str:

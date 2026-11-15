@@ -5,6 +5,8 @@ import re
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.error import HTTPError
+from urllib.parse import unquote
 
 import httpx
 import pytest
@@ -771,3 +773,51 @@ def test_a_reply_that_went_out_reports_sent_even_if_clearing_eyes_fails():
         assert (await call(bridge, "reply", {"chat": SOLO, "text": "hi"})).startswith("sent ")
         assert fake.sent == [(SOLO, "hi")]
     run_bridge(scenario)
+
+
+@pytest.mark.parametrize("agent, send, refused", [
+    ("sous", {"room": "#dev:x", "text": "merged"}, False),
+    ("sous", {"room": "@owner:x", "text": "merged"}, True),
+    ("sous", {"room": "#dev:x", "mentions": ["@owner:x"], "text": "merged"}, True),
+    ("sous", {"room": "#dev:x", "mentions": ["@owner:x"], "text": "merged\n\n— with maple"}, False),
+    ("sous", {"room": "@owner:x", "text": "merged\n\n— with cedar"}, True),
+    ("sous", {"room": "@owner:x", "text": "merged\n\n— with owner"}, True),
+    ("sous", {"room": "@owner:x", "text": "merged", "dangerously_skip_attaching_a_priority": True}, False),
+    ("sous", {"room": "!dmOwner", "text": "merged"}, True),
+    ("sous", {"room": "!dmOwner", "text": "merged\n\n— with maple"}, False),
+    ("sous", {"room": "!dmOther", "text": "merged"}, False),
+    ("sous", {"room": "!notIn", "text": "merged"}, False),
+    ("dev", {"room": "!dmCook", "text": "merged"}, True),
+    ("dev", {"room": "@owner:x", "text": "merged\n\n— with dev"}, True),
+    ("dev", {"room": "@owner:x", "text": "merged\n\n— with cedar"}, False),
+], ids=["not-to-the-owner", "dm", "mention", "credited", "credits-itself", "credits-the-owner", "skip-flag",
+        "dm-by-room-id", "dm-by-room-id-credited", "someone-elses-dm", "a-room-it-isnt-in",
+        "cooks-own-dm", "cook-credits-itself", "cook-credits-the-sous"])
+def test_a_swarm_send_to_the_owner_credits_the_agent_consulted(tmp_path, monkeypatch, agent, send, refused):
+    """With `consult-gate` set, a Swarm send naming or DMing the owner ends
+    with the credit a plow-chat text carries, naming another agent than the
+    sender: the sous, or a cook hired with its own account."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    rooms = {"!dmOwner": ["@cedar:x", "@owner:x"], "!dmOther": ["@cedar:x", "@pat:x"], "!dmCook": ["@dev:x", "@owner:x"]}
+
+    def joined(account, path):
+        room = unquote(path.split("/")[2])
+        if room not in rooms:
+            raise HTTPError(path, 403, "not in the room", None, None)
+        return {"joined": dict.fromkeys(rooms[room], {})}
+    monkeypatch.setattr(plow_chat, "matrix_get", joined)
+    (tmp_path / "cred.json").write_text(json.dumps({"user_id": "@cedar:x"}))
+    swarm = plow_chat.state_dir("boss") / "swarm"
+    swarm.mkdir(parents=True)
+    (swarm / "credential.json").symlink_to(tmp_path / "cred.json")
+    cook = tmp_path / ".swarm/accounts/x/dev/credential.json"
+    cook.parent.mkdir(parents=True)
+    cook.write_text(json.dumps({"user_id": "@dev:x"}))
+    (plow_chat.state_dir("boss") / "cooks").mkdir()
+    (plow_chat.state_dir("boss") / "cooks" / "dev.mcp").write_text(json.dumps(
+        {"mcpServers": {"swarm": {"command": "swarm", "args": ["mcp", "claude", "--account", "@dev:x"]}}}))
+    gate = plow_chat.plow_chat_dir("boss")
+    gate.mkdir(parents=True)
+    assert plow_chat.swarm_send_refusal("boss", agent, send) is None  # no gate, no refusal
+    (gate / plow_chat.CONSULT_GATE).write_text("@owner:x\n")
+    assert (plow_chat.swarm_send_refusal("boss", agent, send) is not None) == refused
