@@ -2,7 +2,9 @@
 import json
 import os
 import shlex
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 from claude_kitchen.tmux import tmux, has_session, target, SESSION
@@ -20,13 +22,34 @@ def check_sous_pid(state_dir: Path):
     rewriting kitchen.json and the MCP config, creating the session, and on the
     has_session branch _sweep_cooks — is a mutation."""
     pid_file = state_dir / "sous.pid"
-    if pid_file.exists():
+    if not pid_file.exists():
+        return
+    try:
+        pid = int(pid_file.read_text().strip())
+    except ValueError:
+        return  # stale pid, fine to proceed
+    # A sous whose terminal just went away (tmux kill-server, a closed window) is still exiting for a moment:
+    # wait for it, up to SOUS_EXIT_WAIT. Never signal it; a live sous, or one still there after the wait, refuses.
+    deadline = time.monotonic() + SOUS_EXIT_WAIT
+    while True:
         try:
-            pid = int(pid_file.read_text().strip())
             os.kill(pid, 0)  # check if process exists
+        except ProcessLookupError:
+            return  # gone, fine to proceed
+        if not _exiting(pid) or time.monotonic() >= deadline:
             sys.exit(f"Sous chef already running (pid {pid}). Exit it first, or kitchen close.")
-        except (ProcessLookupError, ValueError):
-            pass  # stale pid, fine to proceed
+        time.sleep(0.2)
+
+
+SOUS_EXIT_WAIT = 15  # seconds
+
+
+def _exiting(pid: int) -> bool:
+    """Its terminal is gone: the sous was reparented to init (launchd, or a systemd user manager) while it exits."""
+    def ps(field, p):
+        return subprocess.run(["ps", "-o", f"{field}=", "-p", str(p)], capture_output=True, text=True).stdout.strip()
+    ppid = ps("ppid", pid)
+    return ppid == "1" or (ppid != "" and ps("comm", ppid).endswith("systemd"))
 
 
 # Exported to every agent kitchen launches (sous and cooks, any backend).

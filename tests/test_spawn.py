@@ -580,3 +580,48 @@ class TestModelSelection:
                 argv = _codex_argv_from_shell_cmd(cmd)
                 assert "model_reasoning_effort=ultra" in argv, cmd
                 assert ("-m" in argv) == bool(model), cmd
+
+class TestCheckSousPid:
+    """`kitchen open` right after the sous's terminal went away (tmux kill-server: Jeff's restart steps) must wait for
+    the old sous to finish exiting, never signal it, and still refuse a sous that is alive."""
+
+    @staticmethod
+    def _orphan(seconds):
+        """A process whose parent already exited (as a sous is once its tmux is killed); init reaps it when it ends."""
+        import subprocess
+        out = subprocess.run(["sh", "-c", f"sleep {seconds} >/dev/null 2>&1 & echo $!"], capture_output=True, text=True)
+        return int(out.stdout.strip())
+
+    def test_an_exiting_sous_is_waited_for(self, tmp_path, monkeypatch):
+        import time
+        from claude_kitchen import spawn
+        pid = self._orphan(1)
+        (tmp_path / "sous.pid").write_text(str(pid))
+        monkeypatch.setattr(spawn, "_exiting", lambda p: True)
+        t0 = time.monotonic()
+        spawn.check_sous_pid(tmp_path)  # returns once it is gone: no SystemExit
+        assert time.monotonic() - t0 < spawn.SOUS_EXIT_WAIT
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+
+    def test_it_never_signals_the_sous_and_refuses_after_the_wait(self, tmp_path, monkeypatch):
+        from claude_kitchen import spawn
+        pid = self._orphan(30)
+        try:
+            (tmp_path / "sous.pid").write_text(str(pid))
+            monkeypatch.setattr(spawn, "_exiting", lambda p: True)
+            monkeypatch.setattr(spawn, "SOUS_EXIT_WAIT", 0.5)
+            with pytest.raises(SystemExit, match="already running"):
+                spawn.check_sous_pid(tmp_path)
+            os.kill(pid, 0)  # still alive: waiting never kills it
+        finally:
+            os.kill(pid, 9)
+
+    def test_a_live_sous_is_refused_at_once(self, tmp_path):
+        import time
+        from claude_kitchen import spawn
+        (tmp_path / "sous.pid").write_text(str(os.getpid()))  # alive, with its parent: not exiting
+        t0 = time.monotonic()
+        with pytest.raises(SystemExit, match="already running"):
+            spawn.check_sous_pid(tmp_path)
+        assert time.monotonic() - t0 < 1
