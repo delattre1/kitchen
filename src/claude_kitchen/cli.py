@@ -883,6 +883,10 @@ def cmd_hook(args):
 
     if backend == "claude" and (event == "Stop" or payload.get("error") == "authentication_failed"):
         _login_alert(kitchen, name, event == "StopFailure")
+    if backend == "claude" and event == "StopFailure" and shutil.which("swarm"):
+        # A kitchen runs swarm without swarm's Claude Code plugin, whose hook this is:
+        # swarm's running bridge, not this dead session, tells the account's owner.
+        subprocess.run(["swarm", "login-hook"], input=raw, text=True)
 
     if name == "sous":
         # Sous hook is otherwise a no-op — prevents echo loops where the sous's
@@ -1180,7 +1184,7 @@ HOOKS = _PKG_DIR / "hooks"
 # (event, matcher, command, timeout): the Claude hook entries kitchen owns.
 OWNED_HOOKS = (
     ("Stop", None, "kitchen hook", None),
-    ("StopFailure", "authentication_failed", "kitchen hook", None),
+    ("StopFailure", "authentication_failed|rate_limit", "kitchen hook", None),
     ("UserPromptSubmit", "", "kitchen hook", None),
     ("UserPromptSubmit", None, str(HOOKS / "capture-prompt.sh"), None),
     ("PostToolUse", "AskUserQuestion", str(HOOKS / "capture-answer.sh"), None),

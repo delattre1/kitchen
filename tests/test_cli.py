@@ -125,6 +125,31 @@ class TestHook:
         assert status["status"] == "idle" and "chat_message" not in status
         assert [p.get("chat_message") for p in pushes] == (["swarm !room $evt"] if owes_a_chat else [])
 
+    @pytest.mark.parametrize("event", ["StopFailure", "Stop"])
+    def test_a_turn_dead_on_its_login_goes_to_swarm_which_tells_the_owner(self, monkeypatch, tmp_path, event):
+        """The dead session can't speak and a kitchen has no swarm plugin hook:
+        the failure goes to `swarm login-hook`; a turn that ended well doesn't."""
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "swarm").write_text(f'#!/bin/sh\necho "$@" >> {tmp_path}/argv\ncat >> {tmp_path}/stdin\n')
+        (bin_dir / "swarm").chmod(0o755)
+        monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+        monkeypatch.setenv("AGENT_NAME", "sous")
+        monkeypatch.setenv("AGENT_KITCHEN", "risotto")
+        monkeypatch.setenv("STATUS_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        payload = {"hook_event_name": event, "error": "rate_limit", "session_id": "s1",
+                   "last_assistant_message": "You've hit your weekly limit · resets Nov 19 at 8am (UTC)"}
+        _stdin_payload(monkeypatch, **payload)
+
+        cmd_hook(argparse.Namespace(command="hook"))
+
+        if event == "Stop":
+            assert not (tmp_path / "argv").exists()
+        else:
+            assert (tmp_path / "argv").read_text() == "login-hook\n"
+            assert json.loads((tmp_path / "stdin").read_text()) == payload
+
     def test_a_claude_p_run_inside_a_cook_does_not_report_as_it(self, monkeypatch, tmp_path):
         monkeypatch.setenv("AGENT_NAME", "eng")
         monkeypatch.setenv("AGENT_KITCHEN", "risotto")
