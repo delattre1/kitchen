@@ -20,7 +20,8 @@ from claude_kitchen.tmux import (
 from claude_kitchen.state import (
     state_dir, plow_chat_dir, write_status, read_status, update_status, chat_record, read_waits, write_waits,
     project_slug, namespaced, wiki_dir, notes_dir, mcp_servers, channel_socket,
-    atomic_write_json, state_root, swarm_binary, swarm_credential, swarm_join_prompt, swarm_rooms, sous_first_turn,
+    atomic_write_json, state_root, swarm_binary, swarm_credential, swarm_join_prompt, swarm_links, swarm_rooms,
+    sous_first_turn,
     MCP_CONFIG_NAME, LEGACY_MCP_CONFIG_NAME,
 )
 from claude_kitchen.models import max_context_for
@@ -881,8 +882,12 @@ def cmd_hook(args):
     if backend == "claude" and os.environ.get("CLAUDE_CODE_ENTRYPOINT") == "sdk-cli":
         return
 
-    if backend == "claude" and (event == "Stop" or payload.get("error") == "authentication_failed"):
-        _login_alert(kitchen, name, event == "StopFailure")
+    if backend == "claude":
+        channel = _login_channel(kitchen, event, payload.get("error"))
+        if event == "Stop" or channel == "line":
+            _login_alert(kitchen, name, channel == "line")
+        if channel == "swarm":
+            _swarm_login_hook(kitchen, raw)
 
     if name == "sous":
         # Sous hook is otherwise a no-op — prevents echo loops where the sous's
@@ -993,15 +998,39 @@ def cmd_hook(args):
     send_to_socket(channel_socket(base), push)
 
 
+def _login_channel(kitchen: str, event: str, error: str | None) -> str | None:
+    """The one channel that tells the owner a turn died on its Claude login: the
+    kitchen's Plow chat line for an expired login, when it has a line (the only
+    failure the line texts); swarm for every other failure, a usage limit or no
+    line, which itself decides whether the failure is one to tell. None for a
+    turn that ended well."""
+    if event != "StopFailure":
+        return None
+    if error == "authentication_failed" and (plow_chat_dir(kitchen) / "plow-credentials").exists():
+        return "line"
+    return "swarm"
+
+
+def _swarm_login_hook(kitchen: str, raw: str):
+    """Hand the failed turn's hook input to `swarm login-hook`: a kitchen runs swarm
+    without swarm's Claude Code plugin, whose hook this is, and swarm's running bridge,
+    not this dead session, tells the account's owner. It runs with the SWARM_HOME that
+    holds this kitchen's account; a swarm too old to have login-hook exits non-zero, as
+    quietly as no swarm at all."""
+    links = swarm_links(kitchen)
+    if links and (swarm := shutil.which("swarm")):
+        home = links[0].resolve().parents[3]  # <home>/accounts/<server>/<name>/credential.json
+        subprocess.run([swarm, "login-hook"], input=raw, text=True, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, env={**os.environ, "SWARM_HOME": str(home)})
+
+
 def _login_alert(kitchen: str, agent: str, expired: bool):
-    """Tell the owner once, on the kitchen's Plow chat line, that a turn died on
-    an expired Claude login; the session itself can no longer speak. Any turn
-    that ends normally re-arms it. A kitchen with no line has no way to say it."""
+    """Tell the owner once, on the kitchen's Plow chat line (`_login_channel` sends
+    it here only when there is one), that a turn died on an expired Claude login;
+    the session itself can no longer speak. Any turn that ends normally re-arms it."""
     flag = state_dir(kitchen) / "login-expired"
     if not expired:
         flag.unlink(missing_ok=True)
-        return
-    if not (plow_chat_dir(kitchen) / "plow-credentials").exists():
         return
     try:
         flag.open("x").close()  # the sous and its cooks share the login: the first to fail tells
@@ -1180,7 +1209,7 @@ HOOKS = _PKG_DIR / "hooks"
 # (event, matcher, command, timeout): the Claude hook entries kitchen owns.
 OWNED_HOOKS = (
     ("Stop", None, "kitchen hook", None),
-    ("StopFailure", "authentication_failed", "kitchen hook", None),
+    ("StopFailure", "authentication_failed|rate_limit", "kitchen hook", None),
     ("UserPromptSubmit", "", "kitchen hook", None),
     ("UserPromptSubmit", None, str(HOOKS / "capture-prompt.sh"), None),
     ("PostToolUse", "AskUserQuestion", str(HOOKS / "capture-answer.sh"), None),
