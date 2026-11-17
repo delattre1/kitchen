@@ -20,7 +20,8 @@ from claude_kitchen.tmux import (
 from claude_kitchen.state import (
     state_dir, plow_chat_dir, write_status, read_status, update_status, chat_record, read_waits, write_waits,
     project_slug, namespaced, wiki_dir, notes_dir, mcp_servers, channel_socket,
-    atomic_write_json, state_root, swarm_binary, swarm_credential, swarm_join_prompt, swarm_rooms, sous_first_turn,
+    atomic_write_json, state_root, swarm_binary, swarm_credential, swarm_join_prompt, swarm_links, swarm_rooms,
+    sous_first_turn,
     MCP_CONFIG_NAME, LEGACY_MCP_CONFIG_NAME,
 )
 from claude_kitchen.models import max_context_for
@@ -883,10 +884,17 @@ def cmd_hook(args):
 
     if backend == "claude" and (event == "Stop" or payload.get("error") == "authentication_failed"):
         _login_alert(kitchen, name, event == "StopFailure")
-    if backend == "claude" and event == "StopFailure" and shutil.which("swarm"):
-        # A kitchen runs swarm without swarm's Claude Code plugin, whose hook this is:
-        # swarm's running bridge, not this dead session, tells the account's owner.
-        subprocess.run(["swarm", "login-hook"], input=raw, text=True)
+    line = (plow_chat_dir(kitchen) / "plow-credentials").exists()
+    links = swarm_links(kitchen) if backend == "claude" and event == "StopFailure" and not line else []
+    if links and (swarm := shutil.which("swarm")):
+        # One alert per owner: the Plow chat line's text above when there is a line, else
+        # swarm's. A kitchen runs swarm without swarm's Claude Code plugin, whose hook this
+        # is: swarm's running bridge, not this dead session, tells the account's owner. Its
+        # SWARM_HOME is the one holding this kitchen's account; a swarm too old to have
+        # login-hook exits non-zero, as quietly as no swarm at all.
+        home = links[0].resolve().parents[3]  # <home>/accounts/<server>/<name>/credential.json
+        subprocess.run([swarm, "login-hook"], input=raw, text=True, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, env={**os.environ, "SWARM_HOME": str(home)})
 
     if name == "sous":
         # Sous hook is otherwise a no-op — prevents echo loops where the sous's
