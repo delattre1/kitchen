@@ -125,7 +125,8 @@ class TestHook:
         assert status["status"] == "idle" and "chat_message" not in status
         assert [p.get("chat_message") for p in pushes] == (["swarm !room $evt"] if owes_a_chat else [])
 
-    def _dead_login(self, monkeypatch, tmp_path, event="StopFailure", line=False, swarm_exit=0):
+    def _dead_login(self, monkeypatch, tmp_path, event="StopFailure", line=False, swarm_exit=0,
+                    error="authentication_failed"):
         """`kitchen hook` on `event` in kitchen risotto, whose account lives in its own
         SWARM_HOME, with a fake `swarm` that records its argv, SWARM_HOME and stdin and
         exits `swarm_exit`. Returns the owner's Plow chat texts and the hook input."""
@@ -151,22 +152,26 @@ class TestHook:
         monkeypatch.setenv("AGENT_NAME", "sous")
         monkeypatch.setenv("AGENT_KITCHEN", "risotto")
         monkeypatch.setenv("STATUS_DIR", str(kitchen))
-        payload = {"hook_event_name": event, "error": "authentication_failed", "session_id": "s1",
-                   "last_assistant_message": "Login expired · Please run /login"}
+        said = {"authentication_failed": "Login expired · Please run /login",
+                "rate_limit": "You've hit your weekly limit · resets Nov 19 at 8am (UTC)"}[error]
+        payload = {"hook_event_name": event, "error": error, "session_id": "s1", "last_assistant_message": said}
         _stdin_payload(monkeypatch, **payload)
         cmd_hook(argparse.Namespace(command="hook"))
         return texts, payload
 
-    @pytest.mark.parametrize("event,line,told", [("StopFailure", False, "swarm"),
-                                                ("StopFailure", True, "line"),
-                                                ("Stop", False, None)])
+    @pytest.mark.parametrize("event,error,line,told", [
+        ("StopFailure", "authentication_failed", False, "swarm"),
+        ("StopFailure", "authentication_failed", True, "line"),
+        ("StopFailure", "rate_limit", True, "swarm"),
+        ("StopFailure", "rate_limit", False, "swarm"),
+        ("Stop", "authentication_failed", False, None)])
     def test_a_turn_dead_on_its_login_tells_the_owner_once_on_the_line_else_on_swarm(
-            self, monkeypatch, tmp_path, event, line, told):
+            self, monkeypatch, tmp_path, event, error, line, told):
         """The dead session can't speak: a kitchen with a Plow chat line texts the owner
-        there (#99), and only a kitchen without one hands the failure to `swarm login-hook`,
-        with the SWARM_HOME its account lives in, since a kitchen has no swarm plugin hook.
-        A turn that ended well tells no one."""
-        texts, payload = self._dead_login(monkeypatch, tmp_path, event, line)
+        an expired login there (#99), the only failure the line texts; every other failure,
+        a usage limit or no line, goes to `swarm login-hook`, with the SWARM_HOME its account
+        lives in, since a kitchen has no swarm plugin hook. A turn that ended well tells no one."""
+        texts, payload = self._dead_login(monkeypatch, tmp_path, event, line, error=error)
         assert len(texts) == (told == "line")
         if told == "swarm":
             assert (tmp_path / "argv").read_text() == "login-hook\n"
