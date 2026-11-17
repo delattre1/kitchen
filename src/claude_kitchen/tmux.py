@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from claude_kitchen.state import state_root, swarm_held
+from claude_kitchen.state import WINDOWS, state_root, swarm_held
 
 # Per-call tmux timeout. Generous enough that fast queries (has-session,
 # new-session, list-windows) don't spuriously time out when the tmux server is
@@ -136,8 +136,9 @@ def kill_server(kitchen: str):
     """Kill a kitchen's tmux server and remove its socket, which tmux leaves
     behind on exit."""
     tmux("kill-server", kitchen=kitchen)
-    Path(os.environ.get("TMUX_TMPDIR", "/tmp"), f"tmux-{os.getuid()}",
-         socket(kitchen)).unlink(missing_ok=True)
+    if not WINDOWS:  # psmux, Windows' tmux, keeps no socket file
+        Path(os.environ.get("TMUX_TMPDIR", "/tmp"), f"tmux-{os.getuid()}",
+             socket(kitchen)).unlink(missing_ok=True)
 
 
 def has_session(kitchen: str, timeout: int = TIMEOUT) -> bool:

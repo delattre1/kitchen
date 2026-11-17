@@ -1,14 +1,16 @@
 """Spawn logic for claude-kitchen agents."""
+import base64
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 from claude_kitchen.tmux import tmux, has_session, target, SESSION
-from claude_kitchen.state import MCP_CONFIG_NAME, channel_flags, sous_first_turn
+from claude_kitchen.state import MCP_CONFIG_NAME, WINDOWS, channel_flags, pid_alive, sous_first_turn
 
 
 FIRST_TURN_ENV = "KITCHEN_SOUS_FIRST_TURN"
@@ -32,9 +34,7 @@ def check_sous_pid(state_dir: Path):
     # wait for it, up to SOUS_EXIT_WAIT. Never signal it; a live sous, or one still there after the wait, refuses.
     deadline = time.monotonic() + SOUS_EXIT_WAIT
     while True:
-        try:
-            os.kill(pid, 0)  # check if process exists
-        except ProcessLookupError:
+        if not pid_alive(pid):  # not os.kill(pid, 0): on Windows that terminates the sous
             return  # gone, fine to proceed
         if not _exiting(pid) or time.monotonic() >= deadline:
             sys.exit(f"Sous chef already running (pid {pid}). Exit it first, or kitchen close.")
@@ -45,7 +45,11 @@ SOUS_EXIT_WAIT = 15  # seconds
 
 
 def _exiting(pid: int) -> bool:
-    """Its terminal is gone: the sous was reparented to init (launchd, or a systemd user manager) while it exits."""
+    """Its terminal is gone: the sous was reparented to init (launchd, or a systemd user manager) while it exits.
+    Windows reparents nothing and has no ps: there a live sous may be exiting, so it gets the whole wait
+    (ponytail: a sous that really runs costs SOUS_EXIT_WAIT before the refusal)."""
+    if WINDOWS:
+        return True
     def ps(field, p):
         return subprocess.run(["ps", "-o", f"{field}=", "-p", str(p)], capture_output=True, text=True).stdout.strip()
     ppid = ps("ppid", pid)
@@ -110,6 +114,12 @@ def spawn_sous(kitchen: str, state_dir: Path, sous_prompt: str,
     claude_args.extend(json.loads(turn) if turn is not None else sous_first_turn(kitchen))
     if project:
         os.chdir(project)
+    if WINDOWS:
+        # Windows has no exec: os.execvp starts claude and exits, and the pane's
+        # shell would take the console back from under it. So kitchen waits on
+        # it, its pid in sous.pid, and leaves Ctrl-C to claude.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        sys.exit(subprocess.call(claude_args))
     os.execvp("claude", claude_args)
 
 
@@ -151,21 +161,21 @@ def build_shell_cmd(backend: str, name: str, kitchen: str, status_dir: str,
                     effort: str = None, role_path: Path = None,
                     clean_room: bool = False, codex_home: str = None,
                     plugin_dirs: list = None, model: str = None, mcp_config: Path = None) -> str:
-    q = shlex.quote
-    parts = [
-        f"AGENT_NAME={q(name)}",
-        f"AGENT_KITCHEN={q(kitchen)}",
-        f"STATUS_DIR={q(status_dir)}",
-    ]
-    parts.extend(f"{k}={q(v)}" for k, v in os.environ.items() if k.startswith("KITCHEN_"))
-    parts.extend(f"{k}={q(v)}" for k, v in AGENT_ENV.items())
+    # On Windows psmux runs the command in PowerShell, which drops double quotes there and reads curly quotes as
+    # quotes too: so no value is ever PowerShell source. Each is a base64 literal the script decodes ($d), and the
+    # script itself rides in -EncodedCommand. Only Claude cooks so far.
+    if WINDOWS and (backend != "claude" or clean_room):
+        sys.exit("On Windows kitchen hires Claude cooks only, and no clean-room ones, so far.")
+    q = (lambda v: f"(& $d '{base64.b64encode(str(v).encode()).decode()}')") if WINDOWS else shlex.quote
+    env_vars = {"AGENT_NAME": name, "AGENT_KITCHEN": kitchen, "STATUS_DIR": status_dir,
+                **{k: v for k, v in os.environ.items() if k.startswith("KITCHEN_")}, **AGENT_ENV}
     # Clean-room codex cooks run against a fresh, isolated CODEX_HOME (seeded in
     # cmd_hire) — no user config, memory, AGENTS.md, or plugin registry. notify
     # still rides the -c flag below, so cook→sous reporting is unaffected. Gated
     # to codex so the invariant (only codex gets CODEX_HOME) is local here.
     if codex_home and backend == "codex":
-        parts.append(f"CODEX_HOME={q(codex_home)}")
-    env = "export " + " ".join(parts)
+        env_vars["CODEX_HOME"] = codex_home
+    env = "export " + " ".join(f"{k}={q(v)}" for k, v in env_vars.items())
     if backend == "claude":
         effort = _CLAUDE_EFFORT_ALIAS.get(effort, effort)
         effort_flag = f" --effort {q(effort)}" if effort else ""
@@ -183,6 +193,7 @@ def build_shell_cmd(backend: str, name: str, kitchen: str, status_dir: str,
         # branch's export, not the shared `parts` list, so it never spills onto
         # codex/gemini cooks.
         env = f"{env} CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false"
+        env_vars["CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION"] = "false"
         # Clean-room (eval) cooks: disable the superpowers plugin via --settings
         # (no SessionStart injection) without touching subscription auth or the
         # kitchen Stop hook. Auto-memory is already off for every cook (AGENT_ENV).
@@ -207,8 +218,13 @@ def build_shell_cmd(backend: str, name: str, kitchen: str, status_dir: str,
         # kitchen. Getting this wrong would silently rename every cook on the
         # head chef's phone to "kitchen/<cook>".
         rc_name = f"{kitchen}/{name}"
-        rc_flag = f" --remote-control={q(rc_name)}"
-        return f'bash -lc {q(f"{env}; exec claude --dangerously-skip-permissions --disallowedTools AskUserQuestion{rc_flag}{effort_flag}{model_flag}{settings_flag}{plugin_flags}{role_flag}")}'
+        rc_flag = f" {q('--remote-control=' + rc_name)}" if WINDOWS else f" --remote-control={q(rc_name)}"
+        flags = f"--dangerously-skip-permissions --disallowedTools AskUserQuestion{rc_flag}{effort_flag}{model_flag}{settings_flag}{plugin_flags}{role_flag}"
+        if WINDOWS:  # `exit`: the window closes with claude, as `exec` makes it on Unix
+            script = ("$d = { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($args[0])) }; "
+                      + "".join(f"$env:{k} = {q(v)}; " for k, v in env_vars.items()) + f"& claude.exe {flags}")
+            return f"powershell.exe -NoProfile -EncodedCommand {base64.b64encode(script.encode('utf-16-le')).decode()}; exit"
+        return f'bash -lc {shlex.quote(f"{env}; exec claude {flags}")}'
     elif backend == "codex":
         # Codex has no --append-system-prompt-file equivalent. Role delivery
         # happens via send_keys after wait_for_prompt (see cmd_hire).

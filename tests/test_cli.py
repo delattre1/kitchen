@@ -2872,3 +2872,13 @@ def test_confirm_dev_channels_answers_only_the_new_dialog():
         assert not early.exists()
     finally:
         subprocess.run(["tmux", "-S", sock, "kill-server"], check=False)
+
+
+def test_windows_hook_commands_run_in_git_bash(monkeypatch):
+    """Claude Code on Windows runs hooks in Git Bash: a quoted forward-slash path,
+    and a .py on kitchen's own Python (Git Bash's python3 is the Store's stub)."""
+    import claude_kitchen.cli as cli
+    monkeypatch.setattr(cli, "WINDOWS", True)
+    monkeypatch.setattr(cli, "HOOKS", Path("/x/hooks"))
+    assert cli._hook("capture-prompt.sh") == '"/x/hooks/capture-prompt.sh"'
+    assert cli._hook("roborev-pre-push-gate.py") == f'"{Path(sys.executable).as_posix()}" "/x/hooks/roborev-pre-push-gate.py"'
