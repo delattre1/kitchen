@@ -163,9 +163,7 @@ def build_shell_cmd(backend: str, name: str, kitchen: str, status_dir: str,
                     plugin_dirs: list = None, model: str = None, mcp_config: Path = None) -> str:
     # On Windows psmux runs the command in PowerShell, which drops double quotes there and reads curly quotes as
     # quotes too: so no value is ever PowerShell source. Each is a base64 literal the script decodes ($d), and the
-    # script itself rides in -EncodedCommand. Only Claude cooks so far.
-    if WINDOWS and (backend != "claude" or clean_room):
-        sys.exit("On Windows kitchen hires Claude cooks only, and no clean-room ones, so far.")
+    # script itself rides in -EncodedCommand. Only Claude cooks so far: cmd_hire refuses the others.
     q = (lambda v: f"(& $d '{base64.b64encode(str(v).encode()).decode()}')") if WINDOWS else shlex.quote
     env_vars = {"AGENT_NAME": name, "AGENT_KITCHEN": kitchen, "STATUS_DIR": status_dir,
                 **{k: v for k, v in os.environ.items() if k.startswith("KITCHEN_")}, **AGENT_ENV}

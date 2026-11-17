@@ -428,9 +428,7 @@ def cmd_open(args):
     from claude_kitchen import persona
     persona.start(name)
 
-    sous_md = _PKG_DIR / "sous-chef.md"
-    if not sous_md.exists():
-        sys.exit(f"sous-chef.md not found at {sous_md}")
+    prompt = sous_prompt()
 
     # What `kitchen restart sous` needs to relaunch this sous where it runs now.
     kj["sous_launch"] = {"argv": [a for a in sys.argv if a != "--resume"], "cwd": os.getcwd(),
@@ -440,7 +438,7 @@ def cmd_open(args):
     if kj["sous_launch"]["pane"]:
         confirm_dev_channels(kj["sous_launch"]["socket"], kj["sous_launch"]["pane"])
         print(DEV_CHANNELS_NOTICE)
-    spawn_sous(name, base, sous_md.read_text(), project, slug=slug,
+    spawn_sous(name, base, prompt, project, slug=slug,
                resume_session_id=sous_session_id, model=args.model)
 
 
@@ -530,6 +528,14 @@ def _trust_dir(path: str, backend: str):
             atomic_write_json(config, settings)
 
 
+def sous_prompt() -> str:
+    """sous-chef.md, and on Windows what runs there instead of tc and `kitchen restart sous`."""
+    sous_md = _PKG_DIR / "sous-chef.md"
+    if not sous_md.exists():
+        sys.exit(f"sous-chef.md not found at {sous_md}")
+    return sous_md.read_text() + ((_PKG_DIR / "sous-chef-windows.md").read_text() if WINDOWS else "")
+
+
 def cmd_hire(args):
     kitchen = resolve_kitchen(args.kitchen)
     base = state_dir(kitchen)
@@ -540,6 +546,9 @@ def cmd_hire(args):
     # documented follow-up — fail clearly rather than silently no-op.
     if clean_room and backend not in ("claude", "codex"):
         sys.exit(f"--clean-room is only supported for Claude and Codex cooks, not '{backend}' (not yet implemented).")
+    # Before anything is written: psmux runs a cook's launch in PowerShell, written for Claude only so far, and tc is bash.
+    if WINDOWS and (backend != "claude" or clean_room or args.slot):
+        sys.exit("On Windows kitchen hires Claude cooks only, without --clean-room or --slot (tc is a bash tool), so far.")
 
     # --with-skill: opt a custom skill into a clean-room cook (allowlist v1).
     # Each path loads as a session-scoped --plugin-dir (see build_shell_cmd) —
@@ -1281,10 +1290,14 @@ def _place_link(src: Path, dest: Path, moved_from: tuple[str, ...]) -> str:
             return f"ok {dest}"
         if not any(target.as_posix().endswith("/" + m) for m in moved_from):
             return f"skipped {dest}: links to {target}"
-        tmp = dest.with_name(f".{dest.name}.kitchen-tmp")
-        tmp.unlink(missing_ok=True)  # left by an interrupted run
-        _link(tmp, src)
-        os.replace(tmp, dest)  # atomic: a reader never sees the link missing
+        if WINDOWS:  # os.replace can't move onto a junction (a directory): remove the link, never its target, and relink
+            os.rmdir(dest)
+            _link(dest, src)
+        else:
+            tmp = dest.with_name(f".{dest.name}.kitchen-tmp")
+            tmp.unlink(missing_ok=True)  # left by an interrupted run
+            _link(tmp, src)
+            os.replace(tmp, dest)  # atomic: a reader never sees the link missing
         return f"retargeted {dest} (was {target})"
     if dest.exists():
         return f"skipped {dest}: not a symlink"

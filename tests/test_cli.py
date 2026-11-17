@@ -2882,3 +2882,52 @@ def test_windows_hook_commands_run_in_git_bash(monkeypatch):
     monkeypatch.setattr(cli, "HOOKS", Path("/x/hooks"))
     assert cli._hook("capture-prompt.sh") == '"/x/hooks/capture-prompt.sh"'
     assert cli._hook("roborev-pre-push-gate.py") == f'"{Path(sys.executable).as_posix()}" "/x/hooks/roborev-pre-push-gate.py"'
+
+
+def test_windows_sous_is_told_what_runs_there(monkeypatch):
+    """tc (so --slot) and `kitchen restart sous` don't run on Windows: the sous there is told what does instead."""
+    import claude_kitchen.cli as cli
+    unix = cli.sous_prompt()
+    monkeypatch.setattr(cli, "WINDOWS", True)
+    windows = cli.sous_prompt()
+    assert windows.startswith(unix) and "## On Windows" not in unix
+    extra = windows[len(unix):]
+    assert "--slot" in extra and "--project" in extra and "kitchen open --resume" in extra
+
+
+def test_windows_setup_retargets_a_skill_junction(tmp_path, monkeypatch):
+    """A junction is a directory to Windows, so os.replace can't move a new link onto it: setup removes the old
+    link (never what it points at) and makes it again, leaving no temporary link behind."""
+    import claude_kitchen.cli as cli
+    monkeypatch.setattr(cli, "WINDOWS", True)
+    monkeypatch.setattr(cli, "_link", lambda dest, src: dest.symlink_to(src))  # a junction's stand-in here
+    def replace(*a):
+        raise PermissionError("[WinError 5] Access is denied")  # what Windows says moving onto a junction
+    monkeypatch.setattr(cli.os, "replace", replace)
+    monkeypatch.setattr(cli.os, "rmdir", os.unlink)  # rmdir removes a junction on Windows, as unlink a symlink here
+    old = tmp_path / "code-config" / "skills" / "x"
+    new = tmp_path / "kitchen" / "skills" / "x"
+    old.mkdir(parents=True); new.mkdir(parents=True)
+    dest = tmp_path / "home" / "x"
+    dest.parent.mkdir(); dest.symlink_to(old)
+    assert cli._place_link(new, dest, ("code-config/skills/x",)) == f"retargeted {dest} (was {old})"
+    assert Path(os.readlink(dest)) == new and old.is_dir()
+    assert [p.name for p in dest.parent.iterdir()] == ["x"]
+
+
+def test_windows_hire_refuses_before_writing_anything(tmp_path, monkeypatch):
+    """A cook kitchen can't launch on Windows is refused before its role or its 'booting' record is written."""
+    import claude_kitchen.cli as cli
+    monkeypatch.setattr(cli, "WINDOWS", True)
+    monkeypatch.setattr(cli, "state_dir", lambda kitchen: tmp_path)
+    monkeypatch.setattr(cli, "resolve_kitchen", lambda kitchen: "k")
+    monkeypatch.setattr(cli, "resolve_project", lambda path: tmp_path)
+    monkeypatch.setattr(cli, "spawn_window", lambda **kw: pytest.fail("launched a cook Windows can't run"))
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **kw: pytest.fail(f"ran {a[0]}"))
+    for backend, clean_room, slot in (("codex", False, None), ("claude", True, None), ("claude", False, "repo")):
+        args = argparse.Namespace(kitchen="k", name="eng", backend=backend, clean_room=clean_room, slot=slot,
+                                  project=None, role=None, effort=None, with_skill=[], swarm_account=None,
+                                  model=None)
+        with pytest.raises(SystemExit, match="On Windows"):
+            cli.cmd_hire(args)
+        assert not (tmp_path / "cooks").exists(), (backend, clean_room, slot)

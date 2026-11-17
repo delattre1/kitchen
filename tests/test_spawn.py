@@ -642,8 +642,6 @@ def test_windows_claude_cook_never_puts_a_value_in_powershell_source(monkeypatch
     assert tricky in values and f"--remote-control={tricky}/eng" in values and "high" in values
     assert r"C:\roles\eng.md" in values
     assert "& claude.exe --dangerously-skip-permissions --disallowedTools AskUserQuestion" in script
-    with pytest.raises(SystemExit):
-        build_shell_cmd("codex", "rev", "k", "s")
 
 
 def test_windows_kitchen_open_never_signals_a_live_sous(tmp_path, monkeypatch):
