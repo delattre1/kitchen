@@ -125,6 +125,68 @@ class TestHook:
         assert status["status"] == "idle" and "chat_message" not in status
         assert [p.get("chat_message") for p in pushes] == (["swarm !room $evt"] if owes_a_chat else [])
 
+    def _dead_login(self, monkeypatch, tmp_path, event="StopFailure", line=False, swarm_exit=0,
+                    error="authentication_failed"):
+        """`kitchen hook` on `event` in kitchen risotto, whose account lives in its own
+        SWARM_HOME, with a fake `swarm` that records its argv, SWARM_HOME and stdin and
+        exits `swarm_exit`. Returns the owner's Plow chat texts and the hook input."""
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "swarm").write_text(f'#!/bin/sh\necho "$@" >> {tmp_path}/argv\necho "$SWARM_HOME" >> {tmp_path}/home\n'
+                                      f'cat >> {tmp_path}/stdin\necho "error: unrecognized subcommand" >&2\nexit {swarm_exit}\n')
+        (bin_dir / "swarm").chmod(0o755)
+        monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("SWARM_HOME", raising=False)
+        account = tmp_path / "swarm-home" / "accounts" / "s.test" / "oak"
+        account.mkdir(parents=True)
+        (account / "credential.json").write_text("{}")
+        kitchen = tmp_path / ".claude-kitchen" / "risotto"
+        (kitchen / "swarm").mkdir(parents=True)
+        (kitchen / "swarm" / "credential.json").symlink_to(account / "credential.json")
+        if line:
+            (kitchen / "plow-chat").mkdir()
+            (kitchen / "plow-chat" / "plow-credentials").write_text("t")
+        texts = []
+        monkeypatch.setattr("claude_kitchen.plow_chat.tell_owner", lambda _k, text: texts.append(text))
+        monkeypatch.setenv("AGENT_NAME", "sous")
+        monkeypatch.setenv("AGENT_KITCHEN", "risotto")
+        monkeypatch.setenv("STATUS_DIR", str(kitchen))
+        said = {"authentication_failed": "Login expired · Please run /login",
+                "rate_limit": "You've hit your weekly limit · resets Nov 19 at 8am (UTC)"}[error]
+        payload = {"hook_event_name": event, "error": error, "session_id": "s1", "last_assistant_message": said}
+        _stdin_payload(monkeypatch, **payload)
+        cmd_hook(argparse.Namespace(command="hook"))
+        return texts, payload
+
+    @pytest.mark.parametrize("event,error,line,told", [
+        ("StopFailure", "authentication_failed", False, "swarm"),
+        ("StopFailure", "authentication_failed", True, "line"),
+        ("StopFailure", "rate_limit", True, "swarm"),
+        ("StopFailure", "rate_limit", False, "swarm"),
+        ("Stop", "authentication_failed", False, None)])
+    def test_a_turn_dead_on_its_login_tells_the_owner_once_on_the_line_else_on_swarm(
+            self, monkeypatch, tmp_path, event, error, line, told):
+        """The dead session can't speak: a kitchen with a Plow chat line texts the owner
+        an expired login there (#99), the only failure the line texts; every other failure,
+        a usage limit or no line, goes to `swarm login-hook`, with the SWARM_HOME its account
+        lives in, since a kitchen has no swarm plugin hook. A turn that ended well tells no one."""
+        texts, payload = self._dead_login(monkeypatch, tmp_path, event, line, error=error)
+        assert len(texts) == (told == "line")
+        if told == "swarm":
+            assert (tmp_path / "argv").read_text() == "login-hook\n"
+            assert (tmp_path / "home").read_text() == f"{tmp_path / 'swarm-home'}\n"
+            assert json.loads((tmp_path / "stdin").read_text()) == payload
+        else:
+            assert not (tmp_path / "argv").exists()
+
+    def test_a_swarm_without_login_hook_stays_quiet(self, monkeypatch, tmp_path, capfd):
+        """swarm 158 has no login-hook: it exits 2 with a usage error, which must not
+        show on every dead login."""
+        self._dead_login(monkeypatch, tmp_path, swarm_exit=2)
+        assert (tmp_path / "argv").read_text() == "login-hook\n"
+        assert capfd.readouterr() == ("", "")
+
     def test_a_claude_p_run_inside_a_cook_does_not_report_as_it(self, monkeypatch, tmp_path):
         monkeypatch.setenv("AGENT_NAME", "eng")
         monkeypatch.setenv("AGENT_KITCHEN", "risotto")
