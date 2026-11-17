@@ -7,11 +7,54 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 from urllib.request import Request, urlopen
+
+WINDOWS = os.name == "nt"
+
+
+def lock(f, wait: bool = True):
+    """Hold an exclusive lock on the open file `f` until it is closed; when not
+    waiting, a lock held elsewhere raises BlockingIOError. flock on Unix; on
+    Windows msvcrt's lock on byte 0 (ponytail: polled every 50 ms, no fairness)."""
+    if not WINDOWS:
+        import fcntl
+        fcntl.flock(f, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        return
+    import msvcrt
+    f.seek(0)
+    while True:
+        try:
+            return msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            if not wait:
+                raise BlockingIOError(f"{f.name} is locked")
+            time.sleep(0.05)
+
+
+def pid_alive(pid: int) -> bool:
+    """Whether process `pid` runs. On Windows os.kill(pid, 0) would end it, so
+    there the process is opened and its exit code read (259 = still active)."""
+    if not WINDOWS:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return False
+    code = ctypes.c_ulong()
+    try:
+        return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 # Per-kitchen MCP config filename. Deliberately NOT ".mcp.json": Claude Code
@@ -94,14 +137,17 @@ def swarm_binary() -> str:
 def swarm_links(kitchen: str) -> list[Path]:
     """The links to the swarm accounts this kitchen acts as:
     `<state>/swarm/credential.json` (its own account) and `credential-*.json`
-    (one more per other server), each to swarm's copy under ~/.swarm/accounts."""
+    (one more per other server), each to swarm's copy under ~/.swarm/accounts. On
+    Windows, where a symlink needs admin rights, `<state>/swarm` is instead a
+    junction to the one account's folder."""
     swarm = state_dir(kitchen) / "swarm"
     links = [swarm / "credential.json", *sorted(swarm.glob("credential-*.json"))]
+    linked = lambda link: link.is_symlink() or swarm.is_junction()
     for link in links:
-        if link.exists() and not link.is_symlink():
+        if link.exists() and not linked(link):
             sys.exit(f"{link} is a pre-accounts swarm credential: move its account into "
                      "~/.swarm/accounts/<server>/<name>/ and link it back here (see the README).")
-    return links if links[0].is_symlink() else []
+    return links if linked(links[0]) else []
 
 
 def swarm_accounts(kitchen: str) -> list[dict]:
@@ -250,7 +296,8 @@ def atomic_write_json(path: Path, data: dict, mode: int = 0o600):
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
-            os.fchmod(f.fileno(), mode)
+            if not WINDOWS:  # a Windows file takes its profile folder's ACL
+                os.fchmod(f.fileno(), mode)
             f.write(json.dumps(data, indent=2) + "\n")
         os.replace(tmp, path)
     except BaseException:

@@ -1,6 +1,5 @@
 """CLI entry point for claude-kitchen."""
 import argparse
-import fcntl
 import json
 import os
 import re
@@ -22,7 +21,7 @@ from claude_kitchen.state import (
     project_slug, namespaced, wiki_dir, notes_dir, mcp_servers, channel_socket,
     atomic_write_json, state_root, swarm_binary, swarm_credential, swarm_join_prompt, swarm_links, swarm_rooms,
     sous_first_turn,
-    MCP_CONFIG_NAME, LEGACY_MCP_CONFIG_NAME,
+    MCP_CONFIG_NAME, LEGACY_MCP_CONFIG_NAME, WINDOWS, lock, pid_alive,
 )
 from claude_kitchen.models import max_context_for
 from claude_kitchen.outbound import approve_host, operator_setting
@@ -430,9 +429,7 @@ def cmd_open(args):
     from claude_kitchen import persona
     persona.start(name)
 
-    sous_md = _PKG_DIR / "sous-chef.md"
-    if not sous_md.exists():
-        sys.exit(f"sous-chef.md not found at {sous_md}")
+    prompt = sous_prompt()
 
     # What `kitchen restart sous` needs to relaunch this sous where it runs now.
     kj["sous_launch"] = {"argv": [a for a in sys.argv if a != "--resume"], "cwd": os.getcwd(),
@@ -442,7 +439,7 @@ def cmd_open(args):
     if kj["sous_launch"]["pane"]:
         confirm_dev_channels(kj["sous_launch"]["socket"], kj["sous_launch"]["pane"])
         print(DEV_CHANNELS_NOTICE)
-    spawn_sous(name, base, sous_md.read_text(), project, slug=slug,
+    spawn_sous(name, base, prompt, project, slug=slug,
                resume_session_id=sous_session_id, model=args.model)
 
 
@@ -456,13 +453,22 @@ def confirm_dev_channels(socket: str, pane: str) -> None:
     screen, and an Enter fired at that would land on whatever asks next."""
     subprocess.run(["tmux", "-S", socket, "send-keys", "-R", "-t", pane, ";",
                     "clear-history", "-t", pane], check=True)
-    t = shlex.join(["tmux", "-S", socket])
-    pane = shlex.quote(pane)
-    subprocess.Popen(["sh", "-c", f"for i in $(seq 180); do "
-                      f"{t} capture-pane -p -t {pane} | grep -q 'Loading development channels' "
-                      f"&& exec {t} send-keys -t {pane} Enter; sleep 1; done"],
-                     start_new_session=True, stdin=subprocess.DEVNULL,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.Popen([sys.executable, "-c", _DEV_CHANNELS_WATCH, socket, pane], **DETACHED,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+_DEV_CHANNELS_WATCH = """
+import subprocess, sys, time
+t = ["tmux", "-S", sys.argv[1]]
+for _ in range(180):
+    if "Loading development channels" in subprocess.run(t + ["capture-pane", "-p", "-t", sys.argv[2]],
+                                                         capture_output=True, text=True).stdout:
+        sys.exit(subprocess.run(t + ["send-keys", "-t", sys.argv[2], "Enter"]).returncode)
+    time.sleep(1)
+"""
+# A child that outlives this process and its terminal: its own session on Unix;
+# on Windows its own process group (no Ctrl-C from the pane) and a hidden console.
+DETACHED = {"creationflags": 0x08000200} if WINDOWS else {"start_new_session": True}
 
 
 def _seed_codex_home(base: Path, name: str, cwd: str) -> Path:
@@ -509,8 +515,8 @@ def _trust_dir(path: str, backend: str):
     CLI has never opened: Claude's in ~/.claude.json, Codex's in its config.toml.
     Kitchens hiring at once serialize on a lock so neither drops the other's grant."""
     state_root().mkdir(exist_ok=True)
-    with open(state_root() / "trust.lock", "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with open(state_root() / "trust.lock", "w") as held:
+        lock(held)
         if backend == "codex":
             config = Path.home() / ".codex" / "config.toml"
             text = config.read_text()
@@ -523,6 +529,14 @@ def _trust_dir(path: str, backend: str):
             atomic_write_json(config, settings)
 
 
+def sous_prompt() -> str:
+    """sous-chef.md, and on Windows what runs there instead of tc and `kitchen restart sous`."""
+    sous_md = _PKG_DIR / "sous-chef.md"
+    if not sous_md.exists():
+        sys.exit(f"sous-chef.md not found at {sous_md}")
+    return sous_md.read_text() + ((_PKG_DIR / "sous-chef-windows.md").read_text() if WINDOWS else "")
+
+
 def cmd_hire(args):
     kitchen = resolve_kitchen(args.kitchen)
     base = state_dir(kitchen)
@@ -533,6 +547,9 @@ def cmd_hire(args):
     # documented follow-up — fail clearly rather than silently no-op.
     if clean_room and backend not in ("claude", "codex"):
         sys.exit(f"--clean-room is only supported for Claude and Codex cooks, not '{backend}' (not yet implemented).")
+    # Before anything is written: psmux runs a cook's launch in PowerShell, written for Claude only so far, and tc is bash.
+    if WINDOWS and (backend != "claude" or clean_room or args.slot):
+        sys.exit("On Windows kitchen hires Claude cooks only, without --clean-room or --slot (tc is a bash tool), so far.")
 
     # --with-skill: opt a custom skill into a clean-room cook (allowlist v1).
     # Each path loads as a session-scoped --plugin-dir (see build_shell_cmd) —
@@ -723,8 +740,8 @@ def cmd_wait(args):
         sys.exit("kitchen wait needs <source> <chat> <id> and --on <who>.")
     base = state_dir(resolve_kitchen(args.kitchen))
     # The sous can run two of these at once; neither may drop the other's write.
-    with open(base / "waits.lock", "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with open(base / "waits.lock", "w") as held:
+        lock(held)
         waits = read_waits(base)
         if args.source == "done":
             kept = [w for w in waits if w["message"].split()[-1] != args.chat]
@@ -1206,16 +1223,28 @@ PLAYWRIGHT_READ_ONLY_TOOLS = ("mcp__playwright__browser_snapshot", "mcp__playwri
 
 
 HOOKS = _PKG_DIR / "hooks"
+
+
+def _hook(name: str) -> str:
+    """The command for one of kitchen's hook files. Claude Code on Windows runs
+    hooks in Git Bash, which needs a quoted forward-slash path, and whose
+    `python3` is the Microsoft Store's stub: a .py runs on kitchen's own Python."""
+    if not WINDOWS:
+        return str(HOOKS / name)
+    path = f'"{(HOOKS / name).as_posix()}"'
+    return f'"{Path(sys.executable).as_posix()}" {path}' if name.endswith(".py") else path
+
+
 # (event, matcher, command, timeout): the Claude hook entries kitchen owns.
 OWNED_HOOKS = (
     ("Stop", None, "kitchen hook", None),
     ("StopFailure", "authentication_failed|rate_limit", "kitchen hook", None),
     ("UserPromptSubmit", "", "kitchen hook", None),
-    ("UserPromptSubmit", None, str(HOOKS / "capture-prompt.sh"), None),
-    ("PostToolUse", "AskUserQuestion", str(HOOKS / "capture-answer.sh"), None),
-    ("PreToolUse", "Bash", str(HOOKS / "roborev-pre-commit-context.py"), None),
-    ("PreToolUse", "Bash", str(HOOKS / "roborev-pre-push-gate.py"), 660),
-    ("PreToolUse", "Bash", str(HOOKS / "roborev-pre-checkout-gate.py"), None),
+    ("UserPromptSubmit", None, _hook("capture-prompt.sh"), None),
+    ("PostToolUse", "AskUserQuestion", _hook("capture-answer.sh"), None),
+    ("PreToolUse", "Bash", _hook("roborev-pre-commit-context.py"), None),
+    ("PreToolUse", "Bash", _hook("roborev-pre-push-gate.py"), 660),
+    ("PreToolUse", "Bash", _hook("roborev-pre-checkout-gate.py"), None),
     ("PreToolUse", "mcp__swarm.*__send", "kitchen consult-gate", None),
 )
 
@@ -1229,7 +1258,7 @@ def _install_claude_hooks(settings: Path) -> list[str]:
     raw = settings.read_text() if settings.exists() else None
     data = json.loads(raw) if raw else {}
     hooks = data.setdefault("hooks", {})
-    moved = {Path(cmd).name for _, _, cmd, _ in OWNED_HOOKS if "/" in cmd}
+    moved = {Path(cmd.rstrip('"')).name for _, _, cmd, _ in OWNED_HOOKS if "/" in cmd}
     canonical = {(ev, m, cmd, t) for ev, m, cmd, t in OWNED_HOOKS}
     owned = {cmd for _, _, cmd, _ in OWNED_HOOKS}
     added, seen = [], set()
@@ -1263,7 +1292,7 @@ def _install_claude_hooks(settings: Path) -> list[str]:
             continue
         entry = {"type": "command", "command": cmd, **({"timeout": timeout} if timeout else {})}
         hooks.setdefault(ev, []).append({**({"matcher": matcher} if matcher is not None else {}), "hooks": [entry]})
-        added.append(ev if cmd == "kitchen hook" else Path(cmd).name)
+        added.append(ev if cmd == "kitchen hook" else Path(cmd.rstrip('"')).name)
     allow = data.setdefault("permissions", {}).setdefault("allow", [])
     missing = [t for t in PLAYWRIGHT_READ_ONLY_TOOLS if t not in allow]
     if not added and not missing:
@@ -1282,30 +1311,44 @@ def _install_claude_hooks(settings: Path) -> list[str]:
 def _place_link(src: Path, dest: Path, moved_from: tuple[str, ...]) -> str:
     """Point dest at src: create it when absent, retarget it when it points at the
     copy src moved from (a path ending in one of moved_from), otherwise leave it
-    alone. Returns one report line."""
-    if dest.is_symlink():
-        target = Path(os.readlink(dest))
+    alone. Returns one report line. On Windows, where a symlink needs admin
+    rights, the link is a directory junction."""
+    if dest.is_symlink() or dest.is_junction():
+        target = Path(os.readlink(dest).removeprefix("\\\\?\\"))
         if target == src:
             return f"ok {dest}"
         if not any(target.as_posix().endswith("/" + m) for m in moved_from):
             return f"skipped {dest}: links to {target}"
-        tmp = dest.with_name(f".{dest.name}.kitchen-tmp")
-        tmp.unlink(missing_ok=True)  # left by an interrupted run
-        tmp.symlink_to(src)
-        os.replace(tmp, dest)  # atomic: a reader never sees the link missing
+        if WINDOWS:  # os.replace can't move onto a junction (a directory): remove the link, never its target, and relink
+            os.rmdir(dest)
+            _link(dest, src)
+        else:
+            tmp = dest.with_name(f".{dest.name}.kitchen-tmp")
+            tmp.unlink(missing_ok=True)  # left by an interrupted run
+            _link(tmp, src)
+            os.replace(tmp, dest)  # atomic: a reader never sees the link missing
         return f"retargeted {dest} (was {target})"
     if dest.exists():
         return f"skipped {dest}: not a symlink"
     dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.symlink_to(src)
+    _link(dest, src)
     return f"linked {dest}"
+
+
+def _link(dest: Path, src: Path):
+    if WINDOWS:
+        import _winapi
+        _winapi.CreateJunction(str(src), str(dest))
+    else:
+        dest.symlink_to(src)
 
 
 def _link_installs(pkg: Path, home: Path) -> list[str]:
     """Link kitchen's skills into ~/.claude/skills (Claude) and ~/.agents/skills
     (Codex), and its `tc` into ~/.local/bin. A link left by code-config, which
     these moved from, is retargeted. Returns one line per link."""
-    report = [_place_link(pkg / "tc" / "tc", home / ".local" / "bin" / "tc", ("code-config/tc",))]
+    report = [f"skipped {home / '.local' / 'bin' / 'tc'}: tc is a bash tool" if WINDOWS else
+              _place_link(pkg / "tc" / "tc", home / ".local" / "bin" / "tc", ("code-config/tc",))]
     for src in sorted(p for p in (pkg / "skills").iterdir() if p.is_dir()):
         moved = (f"code-config/claude/skills/{src.name}", f"code-config/codex/skills/{src.name}")
         for root in (home / ".claude" / "skills", home / ".agents" / "skills"):
@@ -1328,7 +1371,9 @@ def cmd_setup(args):
         print(f"{'⚠️ ' if line.startswith('skipped') else '✅'} link {line}")
 
     # --- Playwright MCP server (the playwright skill's browser); idempotent ---
-    if subprocess.run(["bash", str(_PKG_DIR / "setup-playwright-mcp.sh")]).returncode != 0:
+    if WINDOWS:
+        print("⚠️  Playwright MCP: not set up on Windows yet (its setup script is bash)")
+    elif subprocess.run(["bash", str(_PKG_DIR / "setup-playwright-mcp.sh")]).returncode != 0:
         all_good = False
 
     # --- mcp SDK ---
@@ -1514,12 +1559,12 @@ def cmd_restart(args):
                  f"(`kitchen open --resume`) once, then restart works.")
     if not kj.get("sous_session_id"):
         sys.exit(f"Kitchen \"{kitchen}\" has no sous session to resume yet.")
+    if WINDOWS:
+        sys.exit("kitchen restart isn't on Windows yet: exit the sous, then run `kitchen open --resume` in its pane.")
     pid = int((base / "sous.pid").read_text())
     # A live sous means its pane is still the one on record; a dead one leaves
     # that pane to whatever runs there now, which respawn-pane -k would kill.
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+    if not pid_alive(pid):
         sys.exit(f"The sous of \"{kitchen}\" isn't running; bring it back with `kitchen open --resume`.")
     # The new sous's swarm joins are built now, while the old sous still runs,
     # so a swarm that fails fails this restart rather than leaving no sous.

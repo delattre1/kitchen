@@ -625,3 +625,32 @@ class TestCheckSousPid:
         with pytest.raises(SystemExit, match="already running"):
             spawn.check_sous_pid(tmp_path)
         assert time.monotonic() - t0 < 1
+def test_windows_claude_cook_never_puts_a_value_in_powershell_source(monkeypatch):
+    """psmux runs a window's command in PowerShell, which drops double quotes there and reads curly quotes
+    (U+2018-201B) as quotes: every value rides base64-encoded inside an -EncodedCommand script."""
+    import base64, re
+    import claude_kitchen.spawn as spawn
+    monkeypatch.setattr(spawn, "WINDOWS", True)
+    tricky = "o'b\u2019r\u201c$(x)\"k"
+    cmd = build_shell_cmd("claude", "eng", tricky, r"C:\Users\me\.claude-kitchen\k", effort="high",
+                          role_path=Path(r"C:\roles\eng.md"))
+    m = re.fullmatch(r"powershell\.exe -NoProfile -EncodedCommand ([A-Za-z0-9+/=]+); exit", cmd)
+    assert m, cmd
+    script = base64.b64decode(m.group(1)).decode("utf-16-le")
+    assert "\u2019" not in script and "$(x)" not in script
+    values = [base64.b64decode(v).decode() for v in re.findall(r"'([A-Za-z0-9+/=]*)'", script)]
+    assert tricky in values and f"--remote-control={tricky}/eng" in values and "high" in values
+    assert r"C:\roles\eng.md" in values
+    assert "& claude.exe --dangerously-skip-permissions --disallowedTools AskUserQuestion" in script
+
+
+def test_windows_kitchen_open_never_signals_a_live_sous(tmp_path, monkeypatch):
+    """On Windows os.kill(pid, 0) terminates the process: the live-sous check must only look (pid_alive)."""
+    import claude_kitchen.spawn as spawn
+    monkeypatch.setattr(spawn, "WINDOWS", True)
+    monkeypatch.setattr(spawn, "SOUS_EXIT_WAIT", 0.3)
+    monkeypatch.setattr(spawn, "pid_alive", lambda pid: True)
+    monkeypatch.setattr(spawn.os, "kill", lambda *a: pytest.fail(f"signalled the sous: os.kill{a}"))
+    (tmp_path / "sous.pid").write_text("4242")
+    with pytest.raises(SystemExit, match="already running"):
+        spawn.check_sous_pid(tmp_path)

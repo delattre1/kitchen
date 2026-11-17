@@ -35,6 +35,23 @@ class TestHandleConnection:
         notified = asyncio.run(run())
         assert notified == [data]
 
+    def test_token_gates_the_windows_loopback_port(self):
+        """With a token (Windows' 127.0.0.1 listener), only a line carrying it is heard, without the token."""
+        async def run(line):
+            reader = asyncio.StreamReader()
+            reader.feed_data(json.dumps(line).encode() + b"\n")
+            reader.feed_eof()
+            notified = []
+
+            async def _append(d):
+                notified.append(d)
+            await handle_connection(reader, None, _append, token="s3cret")
+            return notified
+
+        assert asyncio.run(run({"cook": "eng", "summary": "x"})) == []
+        assert asyncio.run(run({"cook": "eng", "summary": "x", "token": "wrong"})) == []
+        assert asyncio.run(run({"cook": "eng", "summary": "x", "token": "s3cret"})) == [{"cook": "eng", "summary": "x"}]
+
     def test_ignores_invalid_json(self):
         async def run():
             reader = asyncio.StreamReader()

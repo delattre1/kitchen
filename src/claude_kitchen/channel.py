@@ -1,7 +1,8 @@
 """Kitchen channel MCP server — bridges cook hooks to sous chef via Claude Code channels."""
 import asyncio
-import fcntl
+import hmac
 import json
+import secrets
 import socket as sock_mod
 import sys
 from pathlib import Path
@@ -11,6 +12,8 @@ from mcp.server.lowlevel import NotificationOptions, Server
 from mcp.server.stdio import stdio_server
 from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCMessage, JSONRPCNotification, TextContent, Tool
+
+from claude_kitchen.state import WINDOWS, atomic_write_json, lock
 
 
 # One message is one line on the socket, and a line past the reader's limit
@@ -118,13 +121,17 @@ async def push(write_stream, content: str, meta: dict):
     await write_stream.send(SessionMessage(message=JSONRPCMessage(notification)))
 
 
-async def handle_connection(reader: asyncio.StreamReader, writer, notify):
-    """Handle one cook hook connection: read JSON line, call notify."""
+async def handle_connection(reader: asyncio.StreamReader, writer, notify, token: str = None):
+    """Handle one cook hook connection: read JSON line, call notify. With a
+    `token` (Windows' loopback port, which any local process can reach), a
+    line that doesn't carry it is dropped."""
     try:
         line = await reader.readline()
         if not line:
             return
         data = json.loads(line)
+        if token is not None and not hmac.compare_digest(str(data.pop("token", "")), token):
+            return
         await notify(data)
     except (json.JSONDecodeError, ConnectionError):
         pass
@@ -145,10 +152,12 @@ def _claim_socket(sock_path: Path):
     """
     owner = open(sock_path.with_name(sock_path.name + ".lock"), "a")
     try:
-        fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock(owner, wait=False)
     except BlockingIOError:
         print(f"kitchen channel-server: {sock_path} already has a live owner; standing down.", file=sys.stderr)
         raise SystemExit(0)
+    if WINDOWS:  # sock_path is a plain file there, which the holder rewrites
+        return owner
     if sock_path.exists() and not sock_path.is_socket():
         print(f"kitchen channel-server: refusing to bind {sock_path}: not a socket; leaving it untouched.",
               file=sys.stderr)
@@ -208,9 +217,18 @@ async def run_server(kitchen: str):
     # successor's socket after `kitchen close` handed the path on. The next lock
     # holder clears a stale one.
     no_cleanup = {"cleanup_socket": False} if sys.version_info >= (3, 13) else {}
-    sock_server = await asyncio.start_unix_server(
-        on_connection, path=str(sock_path), limit=MAX_MESSAGE_BYTES, **no_cleanup
-    )
+    if WINDOWS:
+        # No unix sockets in Windows' Python: a loopback port, named with a
+        # one-time token in sock_path, which only this user can read.
+        token = secrets.token_hex(16)
+        sock_server = await asyncio.start_server(
+            lambda r, w: handle_connection(r, w, notify, token), "127.0.0.1", 0, limit=MAX_MESSAGE_BYTES
+        )
+        atomic_write_json(sock_path, {"port": sock_server.sockets[0].getsockname()[1], "token": token})
+    else:
+        sock_server = await asyncio.start_unix_server(
+            on_connection, path=str(sock_path), limit=MAX_MESSAGE_BYTES, **no_cleanup
+        )
 
     try:
         async with stdio_server() as (read_stream, write_stream):
@@ -229,6 +247,11 @@ def main(kitchen: str):
 
 def deliver_to_socket(sock_path: Path, data: dict):
     """Send a JSON line to the kitchen socket. OSError means nothing is listening."""
+    if WINDOWS:
+        address = json.loads(sock_path.read_text())
+        with sock_mod.create_connection(("127.0.0.1", address["port"])) as s:
+            s.sendall(json.dumps({**data, "token": address["token"]}).encode() + b"\n")
+        return
     with sock_mod.socket(sock_mod.AF_UNIX, sock_mod.SOCK_STREAM) as s:
         s.connect(str(sock_path))
         s.sendall(json.dumps(data).encode() + b"\n")
