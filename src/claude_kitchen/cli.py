@@ -1671,6 +1671,7 @@ def cmd_close(args):
 def main():
     parser = argparse.ArgumentParser(prog="kitchen", description="claude-kitchen CLI")
     sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("help", help="Show these commands")
 
     p_open = sub.add_parser("open", help="Open a kitchen")
     p_open.add_argument("name", nargs="?", default=None, help="Kitchen/worktree name (omit to use cwd without worktree)")
@@ -1780,7 +1781,9 @@ def main():
 
     args = parser.parse_args()
 
-    if args.command == "open":
+    if args.command == "help":  # `kitchen help`, as a new user tries first
+        parser.print_help()
+    elif args.command == "open":
         cmd_open(args)
     elif args.command == "hire":
         cmd_hire(args)
