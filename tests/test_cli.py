@@ -3064,3 +3064,9 @@ def test_windows_hire_refuses_before_writing_anything(tmp_path, monkeypatch):
         with pytest.raises(SystemExit, match="On Windows"):
             cli.cmd_hire(args)
         assert not (tmp_path / "cooks").exists(), (backend, clean_room, slot)
+
+
+def test_help_command_prints_the_commands(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["kitchen", "help"])
+    main()
+    assert "brigade" in capsys.readouterr().out
