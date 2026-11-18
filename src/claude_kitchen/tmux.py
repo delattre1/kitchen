@@ -4,6 +4,7 @@ import itertools
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -38,6 +39,12 @@ CK_PREFIX = "ck-"
 SESSION = "kitchen"
 
 _buffer_counter = itertools.count()
+
+# tmux itself, also where its installer put it when this terminal's PATH predates
+# it: a fresh Mac's Homebrew (Apple silicon, then Intel) or pixi.
+TMUX = shutil.which("tmux", path=os.pathsep.join([
+    os.environ.get("PATH", ""), "/opt/homebrew/bin", "/usr/local/bin", str(Path.home() / ".pixi" / "bin"),
+])) or "tmux"
 
 
 # A socket path (<tmpdir>/tmux-<uid>/<socket>) must fit a unix socket address,
@@ -84,7 +91,7 @@ def tmux(*args: str, kitchen: str, timeout: int = TIMEOUT,
     once. `kitchen` is keyword-only and required so no call can silently land
     back on the default socket."""
     return subprocess.run(
-        ["tmux", "-L", socket(kitchen), *args], capture_output=True, text=True,
+        [TMUX, "-L", socket(kitchen), *args], capture_output=True, text=True,
         timeout=timeout, input=input, check=check, env=_without_claude_session(),
     )
 
@@ -108,8 +115,8 @@ def attach_cmd(kitchen: str) -> str:
     return f"tmux -L {socket(kitchen)} attach"
 
 
-def list_kitchens() -> list[str]:
-    """Live kitchens, by bare name.
+def list_kitchens(live: bool = True) -> list[str]:
+    """Live kitchens, by bare name; with live=False, every kitchen not closed.
 
     There is no shared server left to enumerate, so candidates come from disk
     (one state dir per kitchen; `kitchen.json` present == not closed) and each
@@ -120,7 +127,7 @@ def list_kitchens() -> list[str]:
     if not root.is_dir():
         return []
     names = sorted(d.name for d in root.iterdir() if (d / "kitchen.json").exists())
-    return [n for n in names if has_session(n, timeout=PROBE_TIMEOUT)]
+    return [n for n in names if not live or has_session(n, timeout=PROBE_TIMEOUT)]
 
 
 def list_windows(kitchen: str, timeout: int = TIMEOUT) -> list[str]:

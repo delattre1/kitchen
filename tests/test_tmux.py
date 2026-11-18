@@ -103,17 +103,17 @@ class TestSocketRouting:
 
     @patch("claude_kitchen.tmux.subprocess.run")
     def test_tmux_prepends_the_kitchen_socket(self, mock_run):
-        from claude_kitchen.tmux import tmux
+        from claude_kitchen.tmux import tmux, TMUX
         mock_run.return_value = _mock_run()
         tmux("has-session", "-t", SESSION, kitchen="ck-risotto")
-        assert mock_run.call_args.args[0][:3] == ["tmux", "-L", "ck-risotto"]
+        assert mock_run.call_args.args[0][:3] == [TMUX, "-L", "ck-risotto"]
 
     @patch("claude_kitchen.tmux.subprocess.run")
     def test_bare_kitchen_name_resolves_to_the_ck_socket(self, mock_run):
-        from claude_kitchen.tmux import tmux
+        from claude_kitchen.tmux import tmux, TMUX
         mock_run.return_value = _mock_run()
         tmux("kill-session", "-t", SESSION, kitchen="risotto")
-        assert mock_run.call_args.args[0][:3] == ["tmux", "-L", "ck-risotto"]
+        assert mock_run.call_args.args[0][:3] == [TMUX, "-L", "ck-risotto"]
 
     def test_session_is_required(self):
         # Keyword-only and mandatory, so no call can silently land back on the

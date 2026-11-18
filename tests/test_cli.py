@@ -2792,6 +2792,95 @@ class TestBrigadeOutput:
         assert '-- "' not in out
 
 
+
+def _kitchen_here(name, sous=None, **kj):
+    """A kitchen on disk; `sous` is its sous's pid (os.getpid() for one that runs)."""
+    d = Path.home() / ".claude-kitchen" / name
+    d.mkdir(parents=True)
+    (d / "kitchen.json").write_text(json.dumps(kj))
+    if sous:
+        (d / "sous.pid").write_text(str(sous))
+
+
+def test_ls_marks_a_kitchen_whose_sous_exited_stopped_with_the_command_that_reopens_it(monkeypatch, capsys):
+    """Its cooks' server outlives a sous that ran in a terminal since closed: attaching there
+    opens an empty session, so ls marks it stopped and prints how to reopen it where it ran."""
+    gone = subprocess.Popen(["true"])
+    gone.wait()
+    _kitchen_here("my-kitchen", sous=gone.pid, source="/home/you/plow/my-kitchen", sous_session_id="s1",
+                  sous_launch={"argv": ["/home/you/.local/bin/kitchen", "open"], "cwd": "/home/you/plow/my-kitchen",
+                               "socket": "", "pane": None})
+    monkeypatch.setattr(sys, "argv", ["kitchen", "ls"])
+    with patch("claude_kitchen.cli.has_session", return_value=True), \
+            patch("claude_kitchen.cli.list_windows", return_value=[]):
+        main()
+    assert capsys.readouterr().out.splitlines() == [
+        "my-kitchen  (stopped)", "  cd /home/you/plow/my-kitchen && kitchen open --resume"]
+
+
+def test_ls_prints_each_running_kitchens_attach_command_to_copy_and_the_stopped_ones(monkeypatch, capsys):
+    _kitchen_here("acme-cos", source="/home/you/plow/acme/cos")
+    _kitchen_here("my-kitchen", sous=os.getpid())
+    monkeypatch.setattr(sys, "argv", ["kitchen", "ls"])
+    with patch("claude_kitchen.cli.has_session", side_effect=lambda k, timeout=None: k == "my-kitchen"), \
+            patch("claude_kitchen.cli.list_windows", return_value=[]), \
+            patch("claude_kitchen.cli._weekly_usage", return_value=None):
+        main()
+    assert capsys.readouterr().out.splitlines() == [
+        "acme-cos  (stopped)", "  cd /home/you/plow/acme/cos && kitchen open", "kitchen attach my-kitchen"]
+
+
+def _sous_tmux(kitchen):
+    """A kitchen whose sous runs in its own tmux, as install.sh starts its agents
+    (plow-<company>-<agent>); returns that socket and pane."""
+    sock = os.path.join(os.environ["TMUX_TMPDIR"], "plow-acme-cos")
+    subprocess.run(["tmux", "-S", sock, "new-session", "-d", "-s", "agent", "sleep", "30"], check=True)
+    pane = subprocess.run(["tmux", "-S", sock, "list-panes", "-F", "#{pane_id}"],
+                          capture_output=True, text=True, check=True).stdout.strip()
+    _kitchen_here(kitchen, sous=os.getpid(), sous_launch={"socket": sock, "pane": pane})
+    return sock, pane
+
+
+def test_ls_prints_the_attach_command_of_a_suspended_kitchen_whose_sous_runs_on(monkeypatch, capsys):
+    """`kitchen suspend` kills only the cooks' server: the sous's own tmux still answers,
+    so ls prints the command that opens it, as attach does."""
+    sock, _ = _sous_tmux("acme-cos")
+    monkeypatch.setattr(sys, "argv", ["kitchen", "ls"])
+    try:
+        with patch("claude_kitchen.cli.has_session", return_value=False):
+            main()
+    finally:
+        subprocess.run(["tmux", "-S", sock, "kill-server"], capture_output=True)
+    assert capsys.readouterr().out.splitlines() == ["kitchen attach acme-cos"]
+
+
+def test_attach_opens_the_sous_where_it_runs_else_the_kitchens_own_server(monkeypatch):
+    """An install.sh agent's sous runs in its own tmux (plow-<company>-<agent>): attach
+    opens that pane. Once that tmux is gone, attach opens the kitchen's server."""
+    sock, pane = _sous_tmux("acme-cos")
+    monkeypatch.setattr(sys, "argv", ["kitchen", "attach", "acme-cos"])
+    try:
+        with patch("claude_kitchen.cli.os.execvp", side_effect=SystemExit) as ex, \
+                patch("claude_kitchen.cli.has_session", return_value=True):
+            with pytest.raises(SystemExit):
+                main()
+            assert ex.call_args.args[1][1:] == ["-S", sock, "attach", "-t", pane]
+            subprocess.run(["tmux", "-S", sock, "kill-server"], check=True)
+            with pytest.raises(SystemExit):
+                main()
+            assert ex.call_args.args[1][1:] == ["-L", "ck-acme-cos", "attach"]
+    finally:
+        subprocess.run(["tmux", "-S", sock, "kill-server"], capture_output=True)
+
+
+def test_attach_to_a_name_not_here_says_so(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["kitchen", "attach", "nope"])
+    with patch("claude_kitchen.cli.has_session", return_value=False), \
+            pytest.raises(SystemExit, match="kitchen ls"):
+        main()
+
+
+
 class TestAgySummary:
     """_agy_summary gates the gemini Stop notification, so it must NEVER raise.
     Regression: a non-string PLANNER_RESPONSE.content (schema drift) used to hit
