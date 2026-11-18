@@ -1867,12 +1867,11 @@ def main():
     elif args.command == "approve-host":
         cmd_approve_host(args)
     elif args.command == "hq-room":
-        from claude_kitchen import hq_room
-        if args.action == "ask":
-            print(json.dumps({**hq_room.ask(args.room, args.prompt or ""), "next": "within 30 minutes, once Sam reacts 🗑️: kitchen hq-room retire"}, indent=2))
-            return
-        result = hq_room.retire(args.room, args.asked_in or "")
+        from claude_kitchen.hq_room import invoke
+        result = invoke(args.action, args.room, (args.prompt if args.action == "ask" else args.asked_in) or "")
         print(json.dumps(result, indent=2))
+        if args.action == "ask":
+            sys.exit(0 if args.prompt and result.get("prompt") == args.prompt else 1)
         sys.exit(0 if result.get("status") == "complete" and not (result.get("error") or result.get("logout_error")) else 1)
     elif args.command in ("hook", "hook-codex", "hook-agy"):
         cmd_hook(args)
