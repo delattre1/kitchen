@@ -14,7 +14,7 @@ from pathlib import Path
 from claude_kitchen.tmux import (
     list_kitchens, list_windows, has_session, target,
     capture_pane, send_keys, tmux, wait_for_prompt, PromptBlocked, kill_server, pane_busy, attach_cmd, join_swarm,
-    PROBE_TIMEOUT, SESSION,
+    PROBE_TIMEOUT, SESSION, TMUX,
 )
 from claude_kitchen.state import (
     state_dir, plow_chat_dir, write_status, read_status, update_status, chat_record, read_waits, write_waits,
@@ -797,8 +797,10 @@ def cmd_approve_host(args):
     print(json.dumps(approve_host(args.account, args.host, customers, operator_setting(env, "APPROVER_SENDER").split()[0], home)))
 
 
-def cmd_brigade(kitchen: str = None):
-    kitchens = list_kitchens()
+def cmd_brigade(kitchen: str = None, every: bool = False):
+    """Each live kitchen and its cooks; with `every` (kitchen ls), each running
+    one by its attach command, alone on its line to copy, and the stopped ones too."""
+    kitchens = list_kitchens(live=not every)
     if kitchen:
         kitchens = [k for k in kitchens if k == kitchen]
 
@@ -807,12 +809,18 @@ def cmd_brigade(kitchen: str = None):
         return
 
     for name in kitchens:
+        if every and not has_session(name, timeout=PROBE_TIMEOUT):
+            print(f"{name}  (stopped)")
+            continue
         base = state_dir(name)
         # The sous has no window; it shows once its status file exists (a usage-limit pause).
         windows = ["sous"] * (base / "cooks" / "sous.json").exists() + list_windows(name)
 
-        week = _weekly_usage()
-        print(f"kitchen: {name}" + (f"  (Claude week {week['used_percentage']:.0f}%)" if week else ""))
+        if every:
+            print(f"kitchen attach {name}")
+        else:
+            week = _weekly_usage()
+            print(f"kitchen: {name}" + (f"  (Claude week {week['used_percentage']:.0f}%)" if week else ""))
 
         # One row per cook: <name>  <status>  <ctx>. Name column padded to
         # the longest name in this kitchen's listing; status padded to a
@@ -826,6 +834,24 @@ def cmd_brigade(kitchen: str = None):
             ctx = _format_tokens(status.get("tokens"))
             resets = f"  resets {status['resets']}" if s == "paused" else ""
             print(f"  {win:<{name_w}}  {s:<7}  {ctx}{resets}")
+
+
+def cmd_attach(args):
+    """This terminal onto a kitchen: the tmux pane its sous runs in, when it runs
+    in one (install.sh's agents, plow-<company>-<agent>), else the kitchen's own
+    server, where its cooks are."""
+    kitchen = resolve_kitchen(args.kitchen)
+    kj = state_dir(kitchen) / "kitchen.json"
+    if not kj.exists():
+        sys.exit(f"No kitchen \"{kitchen}\" here: `kitchen ls` lists them.")
+    launch = json.loads(kj.read_text()).get("sous_launch") or {}
+    if launch.get("pane") and subprocess.run(
+            [TMUX, "-S", launch["socket"], "has-session", "-t", launch["pane"]],
+            capture_output=True, timeout=PROBE_TIMEOUT).returncode == 0:
+        os.execvp(TMUX, [TMUX, "-S", launch["socket"], "attach", "-t", launch["pane"]])
+    if not has_session(kitchen, timeout=PROBE_TIMEOUT):
+        sys.exit(f"Kitchen \"{kitchen}\" is stopped: `kitchen open` in its folder starts it.")
+    os.execvp(TMUX, [TMUX, *shlex.split(attach_cmd(kitchen))[1:]])
 
 
 def _archive_codex_thread(base: Path, cook: str):
@@ -1718,6 +1744,9 @@ def main():
 
     p_brigade = sub.add_parser("brigade", help="Show kitchen status")
     p_brigade.add_argument("kitchen", nargs="?", help="Kitchen name (omit for all)")
+    sub.add_parser("ls", help="List every kitchen here, each running one by the command that opens it (kitchen attach <name>)")
+    p_attach = sub.add_parser("attach", help="Open a kitchen's agent in this terminal (leave it running: Ctrl-b d)")
+    p_attach.add_argument("kitchen", nargs="?", help="Kitchen name, as `kitchen ls` prints it")
 
     p_clock = sub.add_parser("clock-out", help="Clock out a cook (hard kill)")
     p_clock.add_argument("cook", help="Cook name")
@@ -1792,6 +1821,10 @@ def main():
         cmd_peek(args)
     elif args.command == "brigade":
         cmd_brigade(kitchen=args.kitchen)
+    elif args.command == "ls":
+        cmd_brigade(every=True)
+    elif args.command == "attach":
+        cmd_attach(args)
     elif args.command == "clock-out":
         cmd_clock_out(args)
     elif args.command == "sweep":
