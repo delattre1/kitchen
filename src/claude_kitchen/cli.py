@@ -1758,6 +1758,16 @@ def main():
     p_approve.add_argument("account", help="The agent's Swarm id, @name:server")
     p_approve.add_argument("host", help="The host to allow, e.g. example.com")
 
+    p_hq = sub.add_parser("hq-room", help="Retire one HQ room for everyone, for good: IRREVERSIBLE (no undo; history kept, purge off)",
+                          description="Retire one HQ room for everyone. IRREVERSIBLE: its members are removed and nobody can get back in. "
+                                      "1) Send in that room, with swarm's send: 'Retire this room for good? Sam, react 🗑️ to confirm.' "
+                                      "2) kitchen hq-room ask <room> --prompt <its event id>. "
+                                      "3) Within 30 minutes, once Sam reacts: kitchen hq-room retire <room> --asked-in <his reaction's event id>.")
+    p_hq.add_argument("action", choices=["ask", "retire"])
+    p_hq.add_argument("room", help="One HQ room: !roomid or #alias:plow.co, the same form for ask and retire")
+    p_hq.add_argument("--prompt", help="ask: the event id ($...) of the retire prompt you sent in that room")
+    p_hq.add_argument("--asked-in", help="retire: Sam's 🗑️ reaction event id ($...) on that prompt")
+
     p_channel = sub.add_parser("channel-server", help="(internal) Run channel MCP server")
     p_channel.add_argument("kitchen", help="Kitchen name")
     p_plow = sub.add_parser("plow-chat-server", help="(internal) Run the plow-chat channel MCP server")
@@ -1800,6 +1810,14 @@ def main():
         cmd_roles(args)
     elif args.command == "approve-host":
         cmd_approve_host(args)
+    elif args.command == "hq-room":
+        from claude_kitchen import hq_room
+        if args.action == "ask":
+            print(json.dumps({**hq_room.ask(args.room, args.prompt or ""), "next": "within 30 minutes, once Sam reacts 🗑️: kitchen hq-room retire"}, indent=2))
+            return
+        result = hq_room.retire(args.room, args.asked_in or "")
+        print(json.dumps(result, indent=2))
+        sys.exit(0 if result.get("status") == "complete" and not (result.get("error") or result.get("logout_error")) else 1)
     elif args.command in ("hook", "hook-codex", "hook-agy"):
         cmd_hook(args)
     elif args.command == "consult-gate":
