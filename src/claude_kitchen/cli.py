@@ -811,7 +811,7 @@ def cmd_brigade(kitchen: str = None, every: bool = False):
     for name in kitchens:
         if every:
             up = _attach_argv(name)
-            print(f"kitchen attach {name}" if up else f"{name}  (stopped)")
+            print(f"kitchen attach {name}" if up else f"{name}  (stopped)\n  {_reopen_cmd(name)}")
             if not up or not has_session(name, timeout=PROBE_TIMEOUT):
                 continue  # no cooks' server (stopped, or suspended while its sous runs on)
         base = state_dir(name)
@@ -837,10 +837,13 @@ def cmd_brigade(kitchen: str = None, every: bool = False):
 
 
 def _attach_argv(kitchen: str) -> list[str] | None:
-    """The tmux command that opens a kitchen, or None when nothing of it is up: the
-    pane its sous runs in, when it runs in one (install.sh's agents,
-    plow-<company>-<agent>), else the kitchen's own server, where its cooks are.
-    One answer for `kitchen ls` and `kitchen attach`."""
+    """The tmux command that opens a kitchen, or None when its sous isn't running (a
+    cooks' server it left behind is no live kitchen): the pane its sous runs in, when
+    it runs in one (install.sh's agents, plow-<company>-<agent>), else the kitchen's
+    own server, where its cooks are. One answer for `kitchen ls` and `kitchen attach`."""
+    pid = state_dir(kitchen) / "sous.pid"
+    if not (pid.exists() and pid_alive(int(pid.read_text()))):
+        return None
     launch = json.loads((state_dir(kitchen) / "kitchen.json").read_text()).get("sous_launch") or {}
     if launch.get("pane") and subprocess.run(
             [TMUX, "-S", launch["socket"], "has-session", "-t", launch["pane"]],
@@ -851,6 +854,15 @@ def _attach_argv(kitchen: str) -> list[str] | None:
     return None
 
 
+def _reopen_cmd(kitchen: str) -> str:
+    """The line that starts a stopped kitchen's sous again where it last ran, as
+    `kitchen restart` does: its `kitchen open` argv, resuming its conversation."""
+    kj = json.loads((state_dir(kitchen) / "kitchen.json").read_text())
+    launch = kj.get("sous_launch") or {}
+    argv = ["kitchen", *launch.get("argv", ["kitchen", "open"])[1:]] + ["--resume"] * bool(kj.get("sous_session_id"))
+    return f"cd {shlex.quote(launch.get('cwd') or kj.get('worktree') or kj['source'])} && {shlex.join(argv)}"
+
+
 def cmd_attach(args):
     """This terminal onto a kitchen, where _attach_argv says it is."""
     kitchen = resolve_kitchen(args.kitchen)
@@ -858,7 +870,7 @@ def cmd_attach(args):
         sys.exit(f"No kitchen \"{kitchen}\" here: `kitchen ls` lists them.")
     argv = _attach_argv(kitchen)
     if not argv:
-        sys.exit(f"Kitchen \"{kitchen}\" is stopped: `kitchen open` in its folder starts it.")
+        sys.exit(f"Kitchen \"{kitchen}\" is stopped. Reopen it with:\n  {_reopen_cmd(kitchen)}")
     os.execvp(TMUX, argv)
 
 

@@ -2793,21 +2793,41 @@ class TestBrigadeOutput:
 
 
 
-def _kitchen_here(name, **kj):
+def _kitchen_here(name, sous=None, **kj):
+    """A kitchen on disk; `sous` is its sous's pid (os.getpid() for one that runs)."""
     d = Path.home() / ".claude-kitchen" / name
     d.mkdir(parents=True)
     (d / "kitchen.json").write_text(json.dumps(kj))
+    if sous:
+        (d / "sous.pid").write_text(str(sous))
+
+
+def test_ls_marks_a_kitchen_whose_sous_exited_stopped_with_the_command_that_reopens_it(monkeypatch, capsys):
+    """Its cooks' server outlives a sous that ran in a terminal since closed: attaching there
+    opens an empty session, so ls marks it stopped and prints how to reopen it where it ran."""
+    gone = subprocess.Popen(["true"])
+    gone.wait()
+    _kitchen_here("my-kitchen", sous=gone.pid, source="/home/you/plow/my-kitchen", sous_session_id="s1",
+                  sous_launch={"argv": ["/home/you/.local/bin/kitchen", "open"], "cwd": "/home/you/plow/my-kitchen",
+                               "socket": "", "pane": None})
+    monkeypatch.setattr(sys, "argv", ["kitchen", "ls"])
+    with patch("claude_kitchen.cli.has_session", return_value=True), \
+            patch("claude_kitchen.cli.list_windows", return_value=[]):
+        main()
+    assert capsys.readouterr().out.splitlines() == [
+        "my-kitchen  (stopped)", "  cd /home/you/plow/my-kitchen && kitchen open --resume"]
 
 
 def test_ls_prints_each_running_kitchens_attach_command_to_copy_and_the_stopped_ones(monkeypatch, capsys):
-    _kitchen_here("acme-cos")
-    _kitchen_here("my-kitchen")
+    _kitchen_here("acme-cos", source="/home/you/plow/acme/cos")
+    _kitchen_here("my-kitchen", sous=os.getpid())
     monkeypatch.setattr(sys, "argv", ["kitchen", "ls"])
     with patch("claude_kitchen.cli.has_session", side_effect=lambda k, timeout=None: k == "my-kitchen"), \
             patch("claude_kitchen.cli.list_windows", return_value=[]), \
             patch("claude_kitchen.cli._weekly_usage", return_value=None):
         main()
-    assert capsys.readouterr().out.splitlines() == ["acme-cos  (stopped)", "kitchen attach my-kitchen"]
+    assert capsys.readouterr().out.splitlines() == [
+        "acme-cos  (stopped)", "  cd /home/you/plow/acme/cos && kitchen open", "kitchen attach my-kitchen"]
 
 
 def _sous_tmux(kitchen):
@@ -2817,7 +2837,7 @@ def _sous_tmux(kitchen):
     subprocess.run(["tmux", "-S", sock, "new-session", "-d", "-s", "agent", "sleep", "30"], check=True)
     pane = subprocess.run(["tmux", "-S", sock, "list-panes", "-F", "#{pane_id}"],
                           capture_output=True, text=True, check=True).stdout.strip()
-    _kitchen_here(kitchen, sous_launch={"socket": sock, "pane": pane})
+    _kitchen_here(kitchen, sous=os.getpid(), sous_launch={"socket": sock, "pane": pane})
     return sock, pane
 
 
