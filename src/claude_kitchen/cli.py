@@ -809,16 +809,16 @@ def cmd_brigade(kitchen: str = None, every: bool = False):
         return
 
     for name in kitchens:
-        if every and not has_session(name, timeout=PROBE_TIMEOUT):
-            print(f"{name}  (stopped)")
-            continue
+        if every:
+            up = _attach_argv(name)
+            print(f"kitchen attach {name}" if up else f"{name}  (stopped)")
+            if not up or not has_session(name, timeout=PROBE_TIMEOUT):
+                continue  # no cooks' server (stopped, or suspended while its sous runs on)
         base = state_dir(name)
         # The sous has no window; it shows once its status file exists (a usage-limit pause).
         windows = ["sous"] * (base / "cooks" / "sous.json").exists() + list_windows(name)
 
-        if every:
-            print(f"kitchen attach {name}")
-        else:
+        if not every:
             week = _weekly_usage()
             print(f"kitchen: {name}" + (f"  (Claude week {week['used_percentage']:.0f}%)" if week else ""))
 
@@ -836,22 +836,30 @@ def cmd_brigade(kitchen: str = None, every: bool = False):
             print(f"  {win:<{name_w}}  {s:<7}  {ctx}{resets}")
 
 
-def cmd_attach(args):
-    """This terminal onto a kitchen: the tmux pane its sous runs in, when it runs
-    in one (install.sh's agents, plow-<company>-<agent>), else the kitchen's own
-    server, where its cooks are."""
-    kitchen = resolve_kitchen(args.kitchen)
-    kj = state_dir(kitchen) / "kitchen.json"
-    if not kj.exists():
-        sys.exit(f"No kitchen \"{kitchen}\" here: `kitchen ls` lists them.")
-    launch = json.loads(kj.read_text()).get("sous_launch") or {}
+def _attach_argv(kitchen: str) -> list[str] | None:
+    """The tmux command that opens a kitchen, or None when nothing of it is up: the
+    pane its sous runs in, when it runs in one (install.sh's agents,
+    plow-<company>-<agent>), else the kitchen's own server, where its cooks are.
+    One answer for `kitchen ls` and `kitchen attach`."""
+    launch = json.loads((state_dir(kitchen) / "kitchen.json").read_text()).get("sous_launch") or {}
     if launch.get("pane") and subprocess.run(
             [TMUX, "-S", launch["socket"], "has-session", "-t", launch["pane"]],
             capture_output=True, timeout=PROBE_TIMEOUT).returncode == 0:
-        os.execvp(TMUX, [TMUX, "-S", launch["socket"], "attach", "-t", launch["pane"]])
-    if not has_session(kitchen, timeout=PROBE_TIMEOUT):
+        return [TMUX, "-S", launch["socket"], "attach", "-t", launch["pane"]]
+    if has_session(kitchen, timeout=PROBE_TIMEOUT):
+        return [TMUX, *shlex.split(attach_cmd(kitchen))[1:]]
+    return None
+
+
+def cmd_attach(args):
+    """This terminal onto a kitchen, where _attach_argv says it is."""
+    kitchen = resolve_kitchen(args.kitchen)
+    if not (state_dir(kitchen) / "kitchen.json").exists():
+        sys.exit(f"No kitchen \"{kitchen}\" here: `kitchen ls` lists them.")
+    argv = _attach_argv(kitchen)
+    if not argv:
         sys.exit(f"Kitchen \"{kitchen}\" is stopped: `kitchen open` in its folder starts it.")
-    os.execvp(TMUX, [TMUX, *shlex.split(attach_cmd(kitchen))[1:]])
+    os.execvp(TMUX, argv)
 
 
 def _archive_codex_thread(base: Path, cook: str):

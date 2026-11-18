@@ -2810,14 +2810,34 @@ def test_ls_prints_each_running_kitchens_attach_command_to_copy_and_the_stopped_
     assert capsys.readouterr().out.splitlines() == ["acme-cos  (stopped)", "kitchen attach my-kitchen"]
 
 
-def test_attach_opens_the_sous_where_it_runs_else_the_kitchens_own_server(monkeypatch):
-    """An install.sh agent's sous runs in its own tmux (plow-<company>-<agent>): attach
-    opens that pane. Once that tmux is gone, attach opens the kitchen's server."""
+def _sous_tmux(kitchen):
+    """A kitchen whose sous runs in its own tmux, as install.sh starts its agents
+    (plow-<company>-<agent>); returns that socket and pane."""
     sock = os.path.join(os.environ["TMUX_TMPDIR"], "plow-acme-cos")
     subprocess.run(["tmux", "-S", sock, "new-session", "-d", "-s", "agent", "sleep", "30"], check=True)
     pane = subprocess.run(["tmux", "-S", sock, "list-panes", "-F", "#{pane_id}"],
                           capture_output=True, text=True, check=True).stdout.strip()
-    _kitchen_here("acme-cos", sous_launch={"socket": sock, "pane": pane})
+    _kitchen_here(kitchen, sous_launch={"socket": sock, "pane": pane})
+    return sock, pane
+
+
+def test_ls_prints_the_attach_command_of_a_suspended_kitchen_whose_sous_runs_on(monkeypatch, capsys):
+    """`kitchen suspend` kills only the cooks' server: the sous's own tmux still answers,
+    so ls prints the command that opens it, as attach does."""
+    sock, _ = _sous_tmux("acme-cos")
+    monkeypatch.setattr(sys, "argv", ["kitchen", "ls"])
+    try:
+        with patch("claude_kitchen.cli.has_session", return_value=False):
+            main()
+    finally:
+        subprocess.run(["tmux", "-S", sock, "kill-server"], capture_output=True)
+    assert capsys.readouterr().out.splitlines() == ["kitchen attach acme-cos"]
+
+
+def test_attach_opens_the_sous_where_it_runs_else_the_kitchens_own_server(monkeypatch):
+    """An install.sh agent's sous runs in its own tmux (plow-<company>-<agent>): attach
+    opens that pane. Once that tmux is gone, attach opens the kitchen's server."""
+    sock, pane = _sous_tmux("acme-cos")
     monkeypatch.setattr(sys, "argv", ["kitchen", "attach", "acme-cos"])
     try:
         with patch("claude_kitchen.cli.os.execvp", side_effect=SystemExit) as ex, \
