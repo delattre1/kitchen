@@ -9,7 +9,7 @@ import sys
 import tempfile
 import threading
 import tomllib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch, MagicMock, call
 
@@ -197,6 +197,55 @@ class TestHook:
             cmd_hook(argparse.Namespace(command="hook"))
             cmd_brigade(kitchen=None)
             assert capsys.readouterr().out.splitlines()[1].split() == ["sous", "idle", "—"]
+
+    def _turn_ends_at(self, monkeypatch, tmp_path, week, sous_listening=True):
+        """A cook's turn ends with the plan's weekly window at `week` (None: nothing
+        kept); returns what reached the sous from kitchen itself."""
+        usage = tmp_path / ".claude" / "usage" / "rate_limits.json"
+        usage.parent.mkdir(parents=True, exist_ok=True)
+        if week:
+            usage.write_text(json.dumps({"updated_at": "2026-11-17T21:00:00Z", "seven_day": week}))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("AGENT_NAME", "eng")
+        monkeypatch.setenv("AGENT_KITCHEN", "risotto")
+        monkeypatch.setenv("STATUS_DIR", str(tmp_path / "risotto"))
+        _stdin_payload(monkeypatch, hook_event_name="Stop", last_assistant_message="done")
+        pushes = []
+
+        def deliver(_sock, push):
+            if not sous_listening:
+                raise ConnectionRefusedError
+            pushes.append(push)
+        with patch("claude_kitchen.channel.deliver_to_socket", deliver):
+            cmd_hook(argparse.Namespace(command="hook"))
+        return [p["summary"] for p in pushes if p["cook"] == "kitchen"]
+
+    def test_weekly_usage_past_80_then_95_asks_the_sous_to_tell_the_owner_once_each(
+            self, monkeypatch, tmp_path, capsys):
+        """Turns end as the week fills: one notice past 80%, one past 95%, none again in
+        the same window, and one missed while no sous listens is told on a later turn;
+        a new window warns afresh. Brigade shows the week's usage."""
+        resets = int((datetime.now() + timedelta(days=2)).timestamp())
+        assert self._turn_ends_at(monkeypatch, tmp_path, {"used_percentage": 82, "resets_at": resets},
+                                  sous_listening=False) == []
+        told = [self._turn_ends_at(monkeypatch, tmp_path, {"used_percentage": pct, "resets_at": resets})
+                for pct in (50, 83, 85, 96, 97)]
+        assert [len(t) for t in told] == [0, 1, 0, 1, 0]
+        assert told[1][0].startswith("Claude weekly usage is at 83%; it resets ")
+        assert "Tell your owner once" in told[3][0] and "96%" in told[3][0]
+        later = {"used_percentage": 81, "resets_at": resets + 7 * 86400}
+        assert len(self._turn_ends_at(monkeypatch, tmp_path, later)) == 1
+        (tmp_path / ".claude-kitchen" / "risotto").mkdir(parents=True)
+        with patch("claude_kitchen.cli.list_kitchens", return_value=["risotto"]), \
+                patch("claude_kitchen.cli.list_windows", return_value=[]):
+            cmd_brigade(kitchen=None)
+        assert "kitchen: risotto  (Claude week 81%)" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("week", [None, {"used_percentage": 97, "resets_at": 1763629200},
+                                      {"used_percentage": 97}])
+    def test_no_or_stale_usage_warns_no_one(self, monkeypatch, tmp_path, week):
+        """Nothing kept, a window whose reset has passed, or one with no reset time: no notice."""
+        assert self._turn_ends_at(monkeypatch, tmp_path, week) == []
 
     def test_a_swarm_without_login_hook_stays_quiet(self, monkeypatch, tmp_path, capfd):
         """swarm 158 has no login-hook: it exits 2 with a usage error, which must not
@@ -2300,8 +2349,8 @@ class TestCmdSetupHooks:
 
 
 class TestCmdSetupStatusline:
-    """Three-way advisory: no statusLine, different statusLine (embed advice),
-    kitchen segment present (green). None block setup."""
+    """No statusLine: the sous runs kitchen's own. A statusLine of the user's own
+    is advised to embed the kitchen segment and the usage writer. None block setup."""
 
     def _base_settings(self):
         return {
@@ -2321,22 +2370,18 @@ class TestCmdSetupStatusline:
 
     @patch("claude_kitchen.cli.subprocess.run")
     def test_missing_settings_file_advisory(self, mock_run, monkeypatch, tmp_path, capsys):
-        """No settings.json → not-configured branch (both options offered)."""
+        """No settings.json → the sous runs kitchen's own statusline."""
         mock_run.return_value = MagicMock(returncode=0, stdout="2.1.99 (claude)\n", stderr="")
         monkeypatch.setenv("HOME", str(tmp_path))
         from claude_kitchen.cli import cmd_setup
         with pytest.raises(SystemExit):
             cmd_setup(MagicMock())
         out = capsys.readouterr().out
-        assert "Statusline not configured" in out
-        # Option 1 (minimal, segment-direct) + Option 2 (richer packaged).
-        assert "kitchen statusline-segment" in out
-        assert "statusline-command.sh" in out
+        assert "the sous runs kitchen's own" in out
 
     @patch("claude_kitchen.cli.subprocess.run")
     def test_statusline_key_missing_advisory_only(self, mock_run, monkeypatch, tmp_path, capsys):
-        """Valid settings, no statusLine key → not-configured, but setup still
-        exits zero (advisory only)."""
+        """Valid settings, no statusLine key → kitchen's own, and setup exits zero."""
         mock_run.return_value = MagicMock(returncode=0, stdout="2.1.99 (claude)\n", stderr="")
         monkeypatch.setenv("HOME", str(tmp_path))
         self._prep_home(tmp_path, self._base_settings())
@@ -2344,44 +2389,27 @@ class TestCmdSetupStatusline:
         from claude_kitchen.cli import cmd_setup
         cmd_setup(MagicMock())
         out = capsys.readouterr().out
-        assert "Statusline not configured" in out
+        assert "the sous runs kitchen's own" in out
         assert "🍳 All set" in out
 
+    @pytest.mark.parametrize("exists", [False, True], ids=["missing", "existing"])
     @patch("claude_kitchen.cli.subprocess.run")
-    def test_statusline_points_to_missing_file(self, mock_run, monkeypatch, tmp_path, capsys):
-        """Broken path in statusLine.command → treated as not-configured."""
+    def test_custom_statusline_embed_advice(self, mock_run, monkeypatch, tmp_path, capsys, exists):
+        """A statusline of the user's own, even one whose script is missing, stays
+        theirs: setup advises embedding the kitchen segment and the usage writer."""
         mock_run.return_value = MagicMock(returncode=0, stdout="2.1.99 (claude)\n", stderr="")
         monkeypatch.setenv("HOME", str(tmp_path))
-        settings = self._base_settings()
-        settings["statusLine"] = {
-            "type": "command",
-            "command": str(tmp_path / "does-not-exist.sh"),
-        }
-        self._prep_home(tmp_path, settings)
+        script = tmp_path / "custom.sh"
+        if exists:
+            script.write_text("#!/bin/sh\necho hi\n")
+            script.chmod(0o755)
+        self._prep_home(tmp_path, {**self._base_settings(), "statusLine": {"type": "command", "command": str(script)}})
 
         from claude_kitchen.cli import cmd_setup
         cmd_setup(MagicMock())
         out = capsys.readouterr().out
-        assert "Statusline not configured" in out
-
-    @patch("claude_kitchen.cli.subprocess.run")
-    def test_statusline_different_not_kitchen(self, mock_run, monkeypatch, tmp_path, capsys):
-        """User has their own statusline script, no kitchen segment → embed advice."""
-        mock_run.return_value = MagicMock(returncode=0, stdout="2.1.99 (claude)\n", stderr="")
-        monkeypatch.setenv("HOME", str(tmp_path))
-        script = tmp_path / "mystatusline.sh"
-        script.write_text("#!/bin/sh\necho hi\n")
-        script.chmod(0o755)
-        settings = self._base_settings()
-        settings["statusLine"] = {"type": "command", "command": str(script)}
-        self._prep_home(tmp_path, settings)
-
-        from claude_kitchen.cli import cmd_setup
-        cmd_setup(MagicMock())
-        out = capsys.readouterr().out
-        assert "no kitchen segment detected" in out
-        assert "$(kitchen statusline-segment)" in out
-        assert "🍳 All set" in out
+        assert all(s in out for s in ("no kitchen segment detected", "$(kitchen statusline-segment)",
+                                      "rate_limits writer", "🍳 All set"))
 
     @patch("claude_kitchen.cli.subprocess.run")
     def test_statusline_green_when_script_embeds_segment(self, mock_run, monkeypatch, tmp_path, capsys):
@@ -2422,6 +2450,30 @@ class TestCmdSetupStatusline:
         script = _PKG_DIR / "statusline-command.sh"
         assert script.exists(), f"Packaged statusline missing at {script}"
         assert script.stat().st_mode & 0o111, "Packaged statusline should be executable"
+
+    @pytest.mark.parametrize("rate_limits,kept", [
+        ({"five_hour": {"used_percentage": 12.0, "resets_at": 1763600000},
+          "seven_day": {"used_percentage": 83.0, "resets_at": 1763629200}, "spend_limit": {"resets_at": 1}},
+         {"five_hour": {"used_percentage": 12.0, "resets_at": 1763600000},
+          "seven_day": {"used_percentage": 83.0, "resets_at": 1763629200}}),
+        ({"five_hour": {"used_percentage": 5.0, "resets_at": 1763600000}, "seven_day": None},
+         {"five_hour": {"used_percentage": 5.0, "resets_at": 1763600000}}),
+        (None, None)])
+    def test_packaged_script_keeps_the_plans_usage(self, tmp_path, rate_limits, kept):
+        """Each reply's statusline payload leaves ~/.claude/usage/rate_limits.json:
+        the weekly and 5-hour windows Claude passed, and when; nothing without them."""
+        from claude_kitchen.cli import _PKG_DIR
+        payload = {"model": {"id": "claude-opus-5-5"}, "workspace": {"current_dir": str(tmp_path)},
+                   **({"rate_limits": rate_limits} if rate_limits else {})}
+        subprocess.run(["bash", str(_PKG_DIR / "statusline-command.sh")], input=json.dumps(payload), text=True,
+                       capture_output=True, env={**os.environ, "HOME": str(tmp_path)})
+        usage = tmp_path / ".claude" / "usage" / "rate_limits.json"
+        if kept is None:
+            assert not usage.exists()
+            return
+        got = json.loads(usage.read_text())
+        assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", got.pop("updated_at"))
+        assert got == kept
 
     def test_packaged_script_delegates_to_segment_cli(self):
         """The packaged script must reference `kitchen statusline-segment` —

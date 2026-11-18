@@ -92,6 +92,8 @@ You continue talking to the sous while both cook sessions remain visible in tmux
 - **superpowers plugin** — the supplied sous workflow invokes its brainstorming and development skills.
   - Install from Claude Code: `/plugin install superpowers@claude-plugins-official` (the `superpowers-marketplace` install also works)
 - **`mcp` Python SDK** — installed automatically as a transitive dependency of this project; no separate install step is needed.
+- **`jq`** — the sous's status line keeps the plan's usage with it, for the warnings at 80% and 95% of the week.
+  - Verify: `jq --version`
 - **Node.js with `npm`/`npx`** — `kitchen setup` registers the Playwright MCP server (for the `playwright` skill) through `npx`, and on Linux without a system Chromium it resolves Playwright's browser through `npm`.
   - Verify: `npx --version`
 
@@ -99,7 +101,6 @@ You continue talking to the sous while both cook sessions remain visible in tmux
 
 - **Codex CLI** — required only for `--backend codex` cooks. Kitchen forces its completion notify command per cook launch, so `~/.codex/config.toml` needs no kitchen entries.
 - **Antigravity CLI (`agy`)** — required only for the opt-in `--backend gemini` cook. Kitchen does not use a `gemini` binary and `kitchen setup` does not install or check `agy`.
-- **`jq`** — needed only by the packaged richer statusline example, not by the kitchen core.
 
 ## Install
 
@@ -108,11 +109,11 @@ You continue talking to the sous while both cook sessions remain visible in tmux
 On macOS:
 
 ```bash
-brew install tmux git
+brew install tmux git jq
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-On Linux, install tmux and git through your package manager, then install uv with the command above.
+On Linux, install tmux, git and jq through your package manager, then install uv with the command above.
 
 ### 2. Install Claude Code and authenticate
 
@@ -284,6 +285,8 @@ When a cook completes a turn:
 The sous's own Stop hook does not notify its own socket, preventing an echo loop.
 
 A session whose Claude login has expired can't run turns, so it can't say so itself. Claude Code still runs its `StopFailure` hook (matcher `authentication_failed|rate_limit`). In a kitchen with a plow-chat line, that hook texts the owner's 1:1 chat on the line, once: `<agent>: my Claude login expired; run /login in my pane`. The sous and its cooks share the login, so the first to fail sends it, and `login-expired` in the state dir holds the rest. The next turn that ends normally removes that file, so a later expiry is told again. On Swarm, the same hook hands the failure to `swarm login-hook`: the session's running swarm, which holds the account's keys for its end-to-end encrypted DMs, tells the account's owner in their DM, once per 12 hours, including when the plan hits its usage limit. A turn that dies on the usage limit also leaves the agent `paused` in its status file, with Claude's reset time in `resets` (`kitchen brigade` shows `paused  —  resets Nov 20 at 2am (America/Los_Angeles)`); its next turn that ends well sets it idle.
+
+The status line is what Claude Code hands the plan's usage to, after every reply. With no `statusLine` of your own, the sous runs kitchen's `statusline-command.sh`, which keeps it in `~/.claude/usage/rate_limits.json` (`{updated_at, five_hour?, seven_day?}`, each `{used_percentage, resets_at}`). When a turn ends with the week past 80%, and again past 95%, kitchen asks the sous, once per weekly window for the account, to tell the owner in their DM, and `kitchen brigade` shows the week's usage beside each kitchen. A status line of your own keeps it, and `kitchen setup` points you to the writer to copy into it.
 
 ## Where state lives
 
